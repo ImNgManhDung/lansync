@@ -917,8 +917,8 @@ impl SyncEngine {
                 peer_id, remote_name, code
             );
 
-            let accepted = if cfg.auto_accept_pairing {
-                true
+            let (accepted, was_explicit_rejection) = if cfg.auto_accept_pairing {
+                (true, false)
             } else {
                 let (decision_tx, decision_rx) = oneshot::channel();
                 {
@@ -934,8 +934,8 @@ impl SyncEngine {
 
                 // Await decision or 90-second timeout (code TTL)
                 match tokio::time::timeout(Duration::from_secs(90), decision_rx).await {
-                    Ok(Ok(decision)) => decision,
-                    _ => false,
+                    Ok(Ok(decision)) => (decision, !decision),
+                    _ => (false, false),
                 }
             };
 
@@ -954,8 +954,10 @@ impl SyncEngine {
 
             if !accepted || !peer_decision {
                 info!("Pairing failed or rejected with peer {}", peer_id);
-                let mut limiter = self.pairing_limiter.lock().await;
-                limiter.record_failure(&peer_ip, std::time::Instant::now());
+                if was_explicit_rejection {
+                    let mut limiter = self.pairing_limiter.lock().await;
+                    limiter.record_failure(&peer_ip, std::time::Instant::now());
+                }
                 return;
             }
 
