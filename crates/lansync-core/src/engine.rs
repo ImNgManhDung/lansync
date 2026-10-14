@@ -863,7 +863,7 @@ impl SyncEngine {
             device_id: self.identity.device_id.clone(),
             name: cfg.device_name.clone(),
             proto: PROTO_VERSION,
-            pairing: !is_paired,
+            pairing: !is_paired && !is_incoming,
             listen_port: self.local_addr.port(),
         };
         if let Err(e) = tx_msg.send(hello_out).await {
@@ -898,11 +898,15 @@ impl SyncEngine {
         }
         let _ = self.events_tx.send(SyncEvent::PeerDiscovered(incoming_discovered));
 
-        let pairing_mode = !is_paired || pairing_requested;
+        // Pairing mode:
+        // 1) Active dial for pairing: local peer initiated connection and is unpaired.
+        // 2) Incoming pairing request: remote peer initiated connection with pairing=true and is unpaired.
+        let pairing_mode = (!is_paired && !is_incoming) || (!is_paired && is_incoming && pairing_requested);
 
         if pairing_mode {
             let peer_ip = conn.peer_addr.ip().to_string();
-            {
+            // Check rate limiter only on incoming pairing attempts
+            if is_incoming {
                 let limiter = self.pairing_limiter.lock().await;
                 if let Err(err) = limiter.can_attempt(&peer_ip, std::time::Instant::now()) {
                     warn!("Pairing attempt rejected for peer {}: {}", peer_ip, err);
@@ -913,11 +917,14 @@ impl SyncEngine {
 
             let code = pairing_code(&self.identity.cert_der, &peer_cert);
             info!(
-                "Pairing requested with peer {} ({}) - Confirmation Code: [{}]",
-                peer_id, remote_name, code
+                "Pairing handshake with peer {} ({}) - Confirmation Code: [{}] (incoming: {})",
+                peer_id, remote_name, code, is_incoming
             );
 
             let (accepted, was_explicit_rejection) = if cfg.auto_accept_pairing {
+                (true, false)
+            } else if !is_incoming {
+                // Initiator explicitly clicked 'Pair' in UI, automatically accepted locally!
                 (true, false)
             } else {
                 let (decision_tx, decision_rx) = oneshot::channel();
@@ -933,10 +940,12 @@ impl SyncEngine {
                 });
 
                 // Await decision or 90-second timeout (code TTL)
-                match tokio::time::timeout(Duration::from_secs(90), decision_rx).await {
+                let res = match tokio::time::timeout(Duration::from_secs(90), decision_rx).await {
                     Ok(Ok(decision)) => (decision, !decision),
                     _ => (false, false),
-                }
+                };
+                self.pending_pairings.lock().await.remove(&peer_id);
+                res
             };
 
             let _ = tx_msg.send(Message::PairDecision { accept: accepted }).await;
@@ -982,6 +991,11 @@ impl SyncEngine {
             let _ = self
                 .events_tx
                 .send(SyncEvent::PairingAccepted { peer_id: peer_id.clone() });
+        } else if !is_paired {
+            // Neither side requested pairing and peer is not paired (e.g. subnet discovery probe).
+            // Handshake is complete, close connection cleanly.
+            debug!("Unpaired connection with peer {} completed discovery; closing session.", peer_id);
+            return;
         }
 
         // Update last_addr in PeerStore

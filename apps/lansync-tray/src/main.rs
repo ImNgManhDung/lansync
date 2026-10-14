@@ -91,6 +91,7 @@ fn main() {
                             // Automatically show and focus the window when a pairing request arrives!
                             if let Some(w) = app_handle_events.get_webview_window("main") {
                                 let _ = w.show();
+                                let _ = w.unminimize();
                                 let _ = w.set_focus();
                             }
                         }

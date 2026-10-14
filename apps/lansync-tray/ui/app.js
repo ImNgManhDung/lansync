@@ -78,8 +78,8 @@ async function init() {
   await refreshVersions();
   await setupSyncEventSubscriber();
 
-  // Lightweight fallback polling (UI is driven by real-time events)
-  setInterval(refreshStatus, 30000);
+  // Snappy polling to keep UI in sync with LAN discoveries & peer states
+  setInterval(refreshStatus, 3000);
   setInterval(refreshVersions, 10000);
 }
 
@@ -321,9 +321,11 @@ function handleSyncEvent(event) {
       connected: false,
     });
     renderPeers();
+    refreshPeers();
   } else if (event.PairingRequested) {
     const { peer_id, device_name, code } = event.PairingRequested;
     showPairingCard(peer_id, device_name, code);
+    refreshStatus();
   } else if (event.PairingAccepted) {
     hidePairingCard();
     refreshStatus();
@@ -340,6 +342,7 @@ function handleSyncEvent(event) {
     }
     renderPeers();
     setSyncState('idle');
+    refreshStatus();
   } else if (event.PeerDisconnected) {
     const { peer_id } = event.PeerDisconnected;
     const existing = knownPeers.get(peer_id);
@@ -669,7 +672,7 @@ function renderPeers() {
               <option value="mirror_trash" ${p.delete_mode === 'mirror_trash' ? 'selected' : ''}>Thùng rác</option>
             </select>
           ` : ''}
-          <button class="peer-badge ${badgeClass}" ${!isPaired && p.addresses?.length ? `onclick="window.connectPeer('${escapeAttr(p.addresses[0])}')"` : ''}>
+          <button class="peer-badge ${badgeClass}" ${!isPaired && p.addresses?.length ? `onclick="window.connectPeer('${escapeAttr(p.addresses[0])}', this)"` : ''}>
             ${badgeText}
           </button>
           ${isPaired ? `
@@ -778,13 +781,19 @@ window.copyLanAddr = async () => {
   }
 };
 
-window.connectPeer = async (addr) => {
+window.connectPeer = async (addr, btnElement) => {
   if (!addr) return;
+  if (btnElement) {
+    btnElement.innerText = 'Đang gửi...';
+    btnElement.className = 'peer-badge connecting';
+    btnElement.disabled = true;
+  }
   try {
     await invoke('pair_device', { addr });
     await refreshStatus();
   } catch (err) {
     alert('Không thể kết nối tới ' + addr + ': ' + err);
+    await refreshStatus();
   }
 };
 
