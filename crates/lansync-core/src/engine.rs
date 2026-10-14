@@ -237,6 +237,25 @@ impl SyncEngine {
             *engine.discovery.lock().await = Some(disc);
         }
 
+        // Periodic background subnet probe (fallback when mDNS multicast is dropped by router/firewall)
+        let engine_scan = engine.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            engine_scan.scan_subnet_peers().await;
+
+            let mut interval = tokio::time::interval(Duration::from_secs(20));
+            loop {
+                tokio::select! {
+                    _ = engine_scan.shutdown_notify.notified() => {
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        engine_scan.scan_subnet_peers().await;
+                    }
+                }
+            }
+        });
+
         // Loop to accept incoming TCP connections
         let engine_srv = engine.clone();
         tokio::spawn(async move {
@@ -365,14 +384,138 @@ impl SyncEngine {
         disc.values().cloned().collect()
     }
 
-    pub async fn rescan_peers(&self) {
+    pub async fn rescan_peers(self: &Arc<Self>) {
+        if let Some(ref mut disc) = *self.discovery.lock().await {
+            let device_name = self.config.read().await.device_name.clone();
+            let _ = disc.register(&device_name, self.local_addr.port());
+        }
+        self.scan_subnet_peers().await;
         let peers = self.list_discovered_peers().await;
         for peer in peers {
             let _ = self.events_tx.send(SyncEvent::PeerDiscovered(peer));
         }
-        if let Some(ref mut disc) = *self.discovery.lock().await {
-            let device_name = self.config.read().await.device_name.clone();
-            let _ = disc.register(&device_name, self.local_addr.port());
+    }
+
+    /// Actively scans local /24 subnets for peers listening on the sync port.
+    /// This acts as a reliable fallback when mDNS multicast is dropped by Wi-Fi routers or firewalls.
+    pub async fn scan_subnet_peers(self: &Arc<Self>) {
+        let local_ips: Vec<std::net::Ipv4Addr> = if_addrs::get_if_addrs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|iface| {
+                if iface.is_loopback() {
+                    return None;
+                }
+                match iface.addr.ip() {
+                    std::net::IpAddr::V4(ipv4)
+                        if crate::discovery::is_lan_routable_address(&std::net::IpAddr::V4(ipv4)) =>
+                    {
+                        Some(ipv4)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let target_port = self.local_addr.port();
+        let cli_cfg = match client_config(&self.identity) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        for local_ip in local_ips {
+            let [a, b, c, host_byte] = local_ip.octets();
+            let mut set = tokio::task::JoinSet::new();
+
+            for host in 1..=254 {
+                if host == host_byte {
+                    continue;
+                }
+                let target_ip = std::net::Ipv4Addr::new(a, b, c, host);
+                let target_addr = SocketAddr::new(std::net::IpAddr::V4(target_ip), target_port);
+                let cli_cfg_clone = cli_cfg.clone();
+                let engine = self.clone();
+
+                set.spawn(async move {
+                    // Step 1: Fast TCP pre-check (250ms timeout)
+                    let precheck = tokio::time::timeout(
+                        Duration::from_millis(250),
+                        tokio::net::TcpStream::connect(target_addr),
+                    )
+                    .await;
+
+                    if precheck.is_err() || precheck.unwrap().is_err() {
+                        return;
+                    }
+
+                    // Step 2: Full TLS handshake & Hello exchange
+                    if let Ok(conn) = tokio::time::timeout(
+                        Duration::from_millis(1500),
+                        connect(target_addr, cli_cfg_clone.clone()),
+                    )
+                    .await
+                    .unwrap_or(Err(anyhow::anyhow!("timeout")))
+                    {
+                        let (mut r, mut w) = tokio::io::split(conn.stream);
+                        let hello = Message::Hello {
+                            device_id: engine.identity.device_id.clone(),
+                            name: engine.config.read().await.device_name.clone(),
+                            proto: PROTO_VERSION,
+                            pairing: false,
+                            listen_port: engine.local_addr.port(),
+                        };
+
+                        if write_msg(&mut w, &hello).await.is_err() {
+                            return;
+                        }
+
+                        if let Ok(Ok(Message::Hello { device_id, name, listen_port, .. })) =
+                            tokio::time::timeout(Duration::from_millis(1500), read_msg(&mut r)).await
+                        {
+                            if device_id == engine.identity.device_id {
+                                return;
+                            }
+
+                            let peer = DiscoveredPeer {
+                                device_id: device_id.clone(),
+                                device_name: name,
+                                port: listen_port,
+                                addresses: vec![SocketAddr::new(target_addr.ip(), listen_port)],
+                            };
+                            {
+                                let mut disc = engine.discovered_peers.lock().await;
+                                disc.insert(device_id.clone(), peer.clone());
+                            }
+                            info!("Subnet scan discovered peer: {} ({}) at {}", peer.device_name, peer.device_id, target_addr);
+                            let _ = engine.events_tx.send(SyncEvent::PeerDiscovered(peer.clone()));
+
+                            // If this peer is already paired and not connected, connect automatically
+                            let is_paired = {
+                                let store = engine.peer_store.lock().await;
+                                store.list().iter().any(|p| p.device_id == peer.device_id)
+                            };
+                            let is_connected = {
+                                let conns = engine.connected_peers.lock().await;
+                                conns.contains(&peer.device_id)
+                            };
+
+                            if is_paired && !is_connected {
+                                #[allow(clippy::collapsible_if)]
+                                if let Ok(reconn) = connect(target_addr, cli_cfg_clone).await {
+                                    let eng = engine.clone();
+                                    tokio::spawn(async move {
+                                        eng.handle_connection(reconn, false).await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            while let Some(res) = set.join_next().await {
+                let _ = res;
+            }
         }
     }
 
