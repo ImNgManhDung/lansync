@@ -76,6 +76,66 @@ pub fn filetime_from_ns(ns: i64) -> FileTime {
     FileTime::from_unix_time(ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000) as u32)
 }
 
+#[cfg(unix)]
+pub fn available_disk_space(path: &Path) -> std::io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let target = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf())
+    };
+
+    let c_path = CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+            Ok(free)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn available_disk_space(_path: &Path) -> std::io::Result<u64> {
+    Ok(u64::MAX)
+}
+
+/// Cleans up orphaned temporary download files (.lansync-tmp-* and .lansync-part-*)
+/// older than max_age to prevent disk clutter from dropped or crashed transfers.
+pub fn cleanup_orphaned_temps(root: &Path, max_age: Duration) -> std::io::Result<usize> {
+    let mut cleaned = 0;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(0);
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_temp = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with(".lansync-tmp-") || name.starts_with(".lansync-part-"));
+
+        if is_temp {
+            let is_expired = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|elapsed| elapsed >= max_age);
+
+            if is_expired && std::fs::remove_file(&path).is_ok() {
+                cleaned += 1;
+            }
+        }
+    }
+    Ok(cleaned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +174,36 @@ mod tests {
         let ns: i64 = 1_700_000_000_123_456_700; // multiple of 100ns to match NTFS resolution
         filetime::set_file_mtime(&p, filetime_from_ns(ns)).unwrap();
         assert_eq!(mtime_ns(&std::fs::metadata(&p).unwrap()), ns);
+    }
+
+    #[test]
+    fn test_available_disk_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let space = available_disk_space(dir.path()).unwrap();
+        assert!(space > 0, "Available space should be greater than 0");
+    }
+
+    #[test]
+    fn test_cleanup_orphaned_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_tmp = dir.path().join(".lansync-tmp-old123");
+        let new_tmp = dir.path().join(".lansync-tmp-new456");
+        let regular = dir.path().join("keep.txt");
+
+        std::fs::write(&old_tmp, b"old").unwrap();
+        std::fs::write(&new_tmp, b"new").unwrap();
+        std::fs::write(&regular, b"regular").unwrap();
+
+        let old_time = FileTime::from_unix_time(
+            filetime::FileTime::now().unix_seconds() - 48 * 3600,
+            0,
+        );
+        filetime::set_file_mtime(&old_tmp, old_time).unwrap();
+
+        let removed = cleanup_orphaned_temps(dir.path(), Duration::from_secs(24 * 3600)).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!old_tmp.exists());
+        assert!(new_tmp.exists());
+        assert!(regular.exists());
     }
 }

@@ -105,6 +105,19 @@ impl SyncEngine {
             );
         }
 
+        // Cleanup orphaned temporary files older than 24 hours
+        let _ = crate::fsutil::cleanup_orphaned_temps(&config.sync_dir, Duration::from_secs(24 * 3600));
+
+        let sync_dir_cleanup = config.sync_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let _ = crate::fsutil::cleanup_orphaned_temps(&sync_dir_cleanup, Duration::from_secs(24 * 3600));
+            }
+        });
+
         let (events_tx, _) = broadcast::channel(128);
         let shutdown_notify = Arc::new(Notify::new());
 
@@ -883,6 +896,34 @@ impl SyncEngine {
         });
 
         let sync_dir = self.config.read().await.sync_dir.clone();
+
+        // Verify sufficient disk space for all planned downloads
+        let total_download_bytes: u64 = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Download { remote_path, .. } => {
+                    remote_entries.get(remote_path).map(|e| e.size)
+                }
+                _ => None,
+            })
+            .sum();
+
+        let available_space = if total_download_bytes > 0 {
+            crate::fsutil::available_disk_space(&sync_dir).ok()
+        } else {
+            None
+        };
+
+        if let Some(available) = available_space {
+            let required = total_download_bytes.saturating_add(50 * 1024 * 1024);
+            if available < required {
+                warn!(
+                    "Insufficient disk space for sync: required {} bytes, available {} bytes. Skipping download batch.",
+                    required, available
+                );
+                return;
+            }
+        }
 
         for action in actions {
             match action {

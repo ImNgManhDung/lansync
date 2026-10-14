@@ -2178,6 +2178,7 @@ dependencies = [
  "directories",
  "filetime",
  "hostname",
+ "libc",
  "mdns-sd",
  "notify",
  "notify-debouncer-full",

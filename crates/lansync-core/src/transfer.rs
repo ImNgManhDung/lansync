@@ -191,6 +191,32 @@ impl Incoming {
         }
 
         let is_resumable = true;
+
+        // Verify sufficient free disk space before receiving
+        let remaining_needed = size.saturating_sub(actual_offset);
+        if let Ok(available) = crate::fsutil::available_disk_space(root) {
+            let min_required = remaining_needed.saturating_add(10 * 1024 * 1024);
+            if available < min_required {
+                return Self {
+                    root: root.to_path_buf(),
+                    dest_rel: safe_rel,
+                    tmp,
+                    file: None,
+                    hasher,
+                    size,
+                    received: actual_offset,
+                    hash,
+                    mtime_ns,
+                    error: Some(format!(
+                        "Insufficient disk space: required {} bytes, available {} bytes",
+                        min_required, available
+                    )),
+                    done: false,
+                    is_resumable,
+                };
+            }
+        }
+
         let mut me = Self {
             root: root.to_path_buf(),
             dest_rel: safe_rel,

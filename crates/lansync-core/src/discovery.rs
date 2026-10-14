@@ -94,9 +94,29 @@ impl DiscoveryService {
                             .unwrap_or("Unknown")
                             .to_string();
                         let port = info.get_port();
+                        let mut filtered_ips: Vec<_> = info
+                            .get_addresses()
+                            .iter()
+                            .filter(|a| is_lan_routable_address(a))
+                            .copied()
+                            .collect();
+
+                        // Fallback if all were filtered out
+                        if filtered_ips.is_empty() {
+                            filtered_ips = info
+                                .get_addresses()
+                                .iter()
+                                .filter(|a| !a.is_loopback() && !a.is_unspecified())
+                                .copied()
+                                .collect();
+                        }
+
+                        // Sort so primary Wi-Fi/LAN addresses (192.168.*, 10.*) are tried first
+                        filtered_ips.sort_by_key(address_priority);
+
                         let mut addresses = Vec::new();
-                        for addr in info.get_addresses() {
-                            addresses.push(SocketAddr::new(*addr, port));
+                        for addr in filtered_ips {
+                            addresses.push(SocketAddr::new(addr, port));
                         }
 
                         let peer = DiscoveredPeer {
@@ -126,6 +146,54 @@ impl DiscoveryService {
     }
 }
 
+pub fn is_lan_routable_address(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            if ipv4.is_loopback() || ipv4.is_unspecified() || ipv4.is_broadcast() {
+                return false;
+            }
+            let octets = ipv4.octets();
+            // Filter CGNAT used by Tailscale and carrier-grade NAT (100.64.0.0/10)
+            if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+                return false;
+            }
+            // Filter Docker default bridge network (172.17.0.0/16)
+            if octets[0] == 172 && octets[1] == 17 {
+                return false;
+            }
+            true
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() || ipv6.is_unspecified() {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+pub fn address_priority(ip: &std::net::IpAddr) -> u8 {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            // Highest priority: standard Home/Office LAN 192.168.x.x
+            if octets[0] == 192 && octets[1] == 168 {
+                return 0;
+            }
+            // Second priority: 10.x.x.x
+            if octets[0] == 10 {
+                return 1;
+            }
+            // Third priority: 172.16-31.x.x (excluding 172.17)
+            if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                return 2;
+            }
+            3
+        }
+        std::net::IpAddr::V6(_) => 4,
+    }
+}
+
 impl Drop for DiscoveryService {
     fn drop(&mut self) {
         let _ = self.shutdown();
@@ -142,5 +210,27 @@ mod tests {
         service.register("TestDevice", 42424).unwrap();
         let _rx = service.browse().unwrap();
         service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_lan_routable_address_filtering_and_priority() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let loopback: IpAddr = Ipv4Addr::new(127, 0, 0, 1).into();
+        let docker: IpAddr = Ipv4Addr::new(172, 17, 0, 1).into();
+        let tailscale: IpAddr = Ipv4Addr::new(100, 80, 1, 2).into();
+        let home_lan: IpAddr = Ipv4Addr::new(192, 168, 1, 50).into();
+        let office_lan: IpAddr = Ipv4Addr::new(10, 0, 0, 20).into();
+
+        assert!(!is_lan_routable_address(&loopback));
+        assert!(!is_lan_routable_address(&docker));
+        assert!(!is_lan_routable_address(&tailscale));
+        assert!(is_lan_routable_address(&home_lan));
+        assert!(is_lan_routable_address(&office_lan));
+
+        let mut ips = vec![office_lan, home_lan];
+        ips.sort_by_key(address_priority);
+        assert_eq!(ips[0], home_lan);
+        assert_eq!(ips[1], office_lan);
     }
 }
