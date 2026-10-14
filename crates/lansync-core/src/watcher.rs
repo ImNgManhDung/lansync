@@ -40,6 +40,11 @@ impl FolderWatcher {
                                     }
                                     has_relevant_change = true;
                                     break;
+                                } else if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                                    if !is_ignored(file_name) {
+                                        has_relevant_change = true;
+                                        break;
+                                    }
                                 }
                             }
                             if has_relevant_change {

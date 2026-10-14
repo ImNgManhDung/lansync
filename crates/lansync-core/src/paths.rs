@@ -1,21 +1,51 @@
 //! Path normalization and file ignore rules.
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
+
+fn strip_verbatim(p: &Path) -> &Path {
+    let s = p.to_str().unwrap_or("");
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        Path::new(rest)
+    } else {
+        p
+    }
+}
 
 /// Relative path from `root`, formatted as `a/b/c.txt`, NFC normalized.
 /// Returns `None` if outside root, root itself, or non-UTF-8.
+/// Safely handles Windows `\\?\` UNC prefixes, backslashes, and case-insensitive roots.
 pub fn normalize_rel(root: &Path, full: &Path) -> Option<String> {
-    let rel = full.strip_prefix(root).ok()?;
-    let mut parts = Vec::new();
-    for c in rel.components() {
-        match c {
-            Component::Normal(s) => parts.push(s.to_str()?.nfc().collect::<String>()),
-            _ => return None,
+    let clean_root = strip_verbatim(root);
+    let clean_full = strip_verbatim(full);
+
+    let r_str = clean_root.to_str()?;
+    let f_str = clean_full.to_str()?;
+
+    let r_parts: Vec<&str> = r_str.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let f_parts: Vec<&str> = f_str.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+
+    if f_parts.len() <= r_parts.len() {
+        return None;
+    }
+
+    for (r, f) in r_parts.iter().zip(f_parts.iter()) {
+        if r != f && !r.eq_ignore_ascii_case(f) {
+            return None;
         }
     }
+
+    let mut parts = Vec::new();
+    for part in &f_parts[r_parts.len()..] {
+        if *part == "." || *part == ".." {
+            return None;
+        }
+        parts.push(part.nfc().collect::<String>());
+    }
+
     if parts.is_empty() {
         return None;
     }
+
     Some(parts.join("/"))
 }
 
@@ -215,6 +245,17 @@ mod tests {
         let root = Path::new("/tmp/root");
         assert_eq!(normalize_rel(root, Path::new("/tmp/other/a.txt")), None);
         assert_eq!(normalize_rel(root, root), None);
+    }
+
+    #[test]
+    fn test_normalize_rel_windows_unc_and_case() {
+        let root_unc = Path::new(r"\\?\C:\Users\Admin\LanSync");
+        let full_plain = Path::new(r"C:\Users\Admin\LanSync\sub\test.txt");
+        assert_eq!(normalize_rel(root_unc, full_plain).as_deref(), Some("sub/test.txt"));
+
+        let root_lower = Path::new(r"c:\users\admin\lansync");
+        let full_upper = Path::new(r"C:\Users\Admin\LanSync\test.txt");
+        assert_eq!(normalize_rel(root_lower, full_upper).as_deref(), Some("test.txt"));
     }
 
     #[test]

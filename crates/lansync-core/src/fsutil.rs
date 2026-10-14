@@ -19,9 +19,21 @@ pub fn hash_file_stable(path: &Path) -> std::io::Result<Option<Hash>> {
     let before_size = before_meta.len();
     let before_mtime = mtime_ns(&before_meta);
 
-    let mut f = File::open(path)?;
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if is_transient_lock_error(&e) => {
+            // File is temporarily locked by another app (e.g. active copy on Windows)
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
     let mut h = blake3::Hasher::new();
-    std::io::copy(&mut f, &mut h)?;
+    if let Err(e) = std::io::copy(&mut f, &mut h) {
+        if is_transient_lock_error(&e) {
+            return Ok(None);
+        }
+        return Err(e);
+    }
 
     let after_meta = std::fs::metadata(path)?;
     if after_meta.len() != before_size || mtime_ns(&after_meta) != before_mtime {

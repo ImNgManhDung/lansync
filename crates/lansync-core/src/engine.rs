@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use rand::Rng;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -112,6 +112,46 @@ pub struct SyncEngine {
     bandwidth_limit_kbps: Arc<std::sync::atomic::AtomicU32>,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedDownload {
+    local_path: String,
+    remote_path: String,
+    hash: Hash,
+    expected_local: Option<Hash>,
+}
+
+async fn trigger_next_download(
+    sync_dir: &Path,
+    queue: &mut VecDeque<QueuedDownload>,
+    expected_map: &mut HashMap<String, Option<Hash>>,
+    remote_entries: &HashMap<String, Entry>,
+    tx: &mpsc::Sender<Message>,
+) {
+    if let Some(item) = queue.pop_front() {
+        expected_map.insert(item.local_path.clone(), item.expected_local);
+        let expected_size = remote_entries.get(&item.remote_path).map(|e| e.size).unwrap_or(0);
+        let resume_offset = crate::transfer::check_resume_offset(sync_dir, &item.local_path, &item.hash, expected_size).await;
+        if resume_offset > 0 {
+            info!("Resuming download for {} at offset {}", item.local_path, resume_offset);
+            let _ = tx
+                .send(Message::GetFileRange {
+                    path: item.remote_path,
+                    hash: item.hash,
+                    offset: resume_offset,
+                })
+                .await;
+        } else {
+            info!("Requesting download for {}", item.local_path);
+            let _ = tx
+                .send(Message::GetFile {
+                    path: item.remote_path,
+                    hash: item.hash,
+                })
+                .await;
+        }
+    }
+}
+
 impl SyncEngine {
     pub async fn start(config: Config, data_dir: PathBuf) -> Result<Arc<Self>> {
         tokio::fs::create_dir_all(&data_dir).await?;
@@ -202,20 +242,32 @@ impl SyncEngine {
         )?;
         *engine._watcher.lock().await = Some(watcher);
 
-        // Task to handle file watcher events
+        // Task to handle file watcher events and periodic rescans
         let engine_watcher = engine.clone();
         tokio::spawn(async move {
-            while watcher_rx.recv().await.is_some() {
-                if engine_watcher.is_paused() {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            ticker.tick().await; // consume first immediate tick
+            loop {
+                let should_scan = tokio::select! {
+                    _ = engine_watcher.shutdown_notify.notified() => break,
+                    res = watcher_rx.recv() => res.is_some(),
+                    _ = ticker.tick() => {
+                        let has_peers = !engine_watcher.active_peer_senders.lock().await.is_empty();
+                        has_peers
+                    }
+                };
+
+                if !should_scan || engine_watcher.is_paused() {
                     continue;
                 }
-                debug!("Watcher detected changes, rescanning index...");
+
+                debug!("Rescanning local index...");
                 let changed_entries = {
                     let mut db = engine_watcher.index_db.lock().await;
                     match db.scan() {
                         Ok(report) => report.changed,
                         Err(e) => {
-                            warn!("Index scan error after watcher event: {:?}", e);
+                            warn!("Index scan error after watcher/periodic event: {:?}", e);
                             Vec::new()
                         }
                     }
@@ -906,7 +958,7 @@ impl SyncEngine {
         // Check if peer is already paired
         let is_paired = {
             let store = self.peer_store.lock().await;
-            store.find_by_fingerprint(&peer_fp).is_some()
+            store.find_by_fingerprint(&peer_fp).is_some() || store.get(&peer_id).is_some()
         };
 
         let cfg = self.config.read().await.clone();
@@ -1051,13 +1103,7 @@ impl SyncEngine {
                 .send(SyncEvent::PairingAccepted { peer_id: peer_id.clone() });
         } else if !is_paired {
             // Neither side requested pairing and peer is not paired.
-            // If remote connected thinking it is paired, notify it so both peers are in sync.
-            if is_incoming {
-                debug!("Unpaired incoming connection from peer {} without pairing request; notifying unpair.", peer_id);
-                let _ = tx_msg.send(Message::Unpair).await;
-            } else {
-                debug!("Unpaired connection with peer {} completed discovery; closing session.", peer_id);
-            }
+            debug!("Unpaired connection with peer {} completed discovery; closing session.", peer_id);
             return;
         }
 
@@ -1092,13 +1138,6 @@ impl SyncEngine {
             if !am_dialer && !is_incoming {
                 info!(
                     "Tie-breaker: Dropping outgoing connection to {} because remote peer is active dialer",
-                    peer_id
-                );
-                return;
-            }
-            if am_dialer && !is_incoming {
-                info!(
-                    "Tie-breaker: Dropping duplicate outgoing connection to {} because connection is already active",
                     peer_id
                 );
                 return;
@@ -1144,6 +1183,7 @@ impl SyncEngine {
         }
 
         let mut remote_entries: HashMap<String, Entry> = HashMap::new();
+        let mut download_queue: VecDeque<QueuedDownload> = VecDeque::new();
         let mut expected_expected_local: HashMap<String, Option<Hash>> = HashMap::new();
         let mut current_incoming: Option<Incoming> = None;
         let mut current_incoming_path: Option<String> = None;
@@ -1232,6 +1272,8 @@ impl SyncEngine {
                         &remote_entries,
                         &tx_msg,
                         &mut expected_expected_local,
+                        &mut download_queue,
+                        current_incoming.is_some(),
                     )
                     .await;
                 }
@@ -1245,6 +1287,8 @@ impl SyncEngine {
                         &remote_entries,
                         &tx_msg,
                         &mut expected_expected_local,
+                        &mut download_queue,
+                        current_incoming.is_some(),
                     )
                     .await;
                 }
@@ -1315,9 +1359,27 @@ impl SyncEngine {
                             }
                         }
                     }
+                    let sync_dir = self.config.read().await.sync_dir.clone();
+                    trigger_next_download(
+                        &sync_dir,
+                        &mut download_queue,
+                        &mut expected_expected_local,
+                        &remote_entries,
+                        &tx_msg,
+                    )
+                    .await;
                 }
                 Message::FileUnavailable { path } => {
                     debug!("Peer reported file {} unavailable", path);
+                    let sync_dir = self.config.read().await.sync_dir.clone();
+                    trigger_next_download(
+                        &sync_dir,
+                        &mut download_queue,
+                        &mut expected_expected_local,
+                        &remote_entries,
+                        &tx_msg,
+                    )
+                    .await;
                 }
                 Message::Ping => {
                     let _ = tx_msg.send(Message::Pong).await;
@@ -1370,6 +1432,8 @@ impl SyncEngine {
         remote_entries: &HashMap<String, Entry>,
         tx_msg: &mpsc::Sender<Message>,
         expected_local_map: &mut HashMap<String, Option<Hash>>,
+        download_queue: &mut VecDeque<QueuedDownload>,
+        is_downloading: bool,
     ) {
         if self.is_paused() {
             return;
@@ -1454,25 +1518,13 @@ impl SyncEngine {
         for action in actions {
             match action {
                 Action::Download { local_path, remote_path, hash, expected_local } => {
-                    expected_local_map.insert(local_path.clone(), expected_local);
-                    let expected_size = remote_entries.get(&remote_path).map(|e| e.size).unwrap_or(0);
-                    let resume_offset = crate::transfer::check_resume_offset(&sync_dir, &local_path, &hash, expected_size).await;
-                    if resume_offset > 0 {
-                        tracing::info!("Resuming download for {} at offset {}", local_path, resume_offset);
-                        let _ = tx_msg
-                            .send(Message::GetFileRange {
-                                path: remote_path,
-                                hash,
-                                offset: resume_offset,
-                            })
-                            .await;
-                    } else {
-                        let _ = tx_msg
-                            .send(Message::GetFile {
-                                path: remote_path,
-                                hash,
-                            })
-                            .await;
+                    if !download_queue.iter().any(|q| q.local_path == local_path) {
+                        download_queue.push_back(QueuedDownload {
+                            local_path,
+                            remote_path,
+                            hash,
+                            expected_local,
+                        });
                     }
                 }
                 Action::UpdateBase { path, hash } => {
@@ -1502,14 +1554,15 @@ impl SyncEngine {
                         });
                     }
 
-                    // Download remote copy to original filename
-                    expected_local_map.insert(local_path, None);
-                    let _ = tx_msg
-                        .send(Message::GetFile {
-                            path: remote_path,
+                    // Queue download remote copy to original filename
+                    if !download_queue.iter().any(|q| q.local_path == local_path) {
+                        download_queue.push_back(QueuedDownload {
+                            local_path,
+                            remote_path,
                             hash,
-                        })
-                        .await;
+                            expected_local: None,
+                        });
+                    }
                 }
                 Action::Rename { from_path, to_path, hash } => {
                     let src = to_fs_path(&sync_dir, &from_path);
@@ -1544,13 +1597,14 @@ impl SyncEngine {
                         }
                     } else {
                         // Fallback to normal download if rename fails
-                        expected_local_map.insert(to_path.clone(), None);
-                        let _ = tx_msg
-                            .send(Message::GetFile {
-                                path: to_path,
+                        if !download_queue.iter().any(|q| q.local_path == to_path) {
+                            download_queue.push_back(QueuedDownload {
+                                local_path: to_path.clone(),
+                                remote_path: to_path,
                                 hash,
-                            })
-                            .await;
+                                expected_local: None,
+                            });
+                        }
                     }
                 }
                 Action::Trash { path } => {
@@ -1601,6 +1655,17 @@ impl SyncEngine {
                     }
                 }
             }
+        }
+
+        if !is_downloading {
+            trigger_next_download(
+                &sync_dir,
+                download_queue,
+                expected_local_map,
+                remote_entries,
+                tx_msg,
+            )
+            .await;
         }
 
         let _ = self
