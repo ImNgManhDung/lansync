@@ -2178,6 +2178,7 @@ dependencies = [
  "directories",
  "filetime",
  "hostname",
+ "if-addrs",
  "libc",
  "mdns-sd",
  "notify",

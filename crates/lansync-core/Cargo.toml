@@ -30,6 +30,7 @@ notify-debouncer-full = "0.5"
 directories = "6"
 hostname = "0.4"
 tracing = "0.1"
+if-addrs = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

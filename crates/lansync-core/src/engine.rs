@@ -538,13 +538,13 @@ impl SyncEngine {
             return;
         }
 
-        let remote_hello = match read_msg(&mut r).await {
-            Ok(Message::Hello { device_id, name, proto, pairing, .. }) => {
+        let (remote_id, remote_name, pairing_requested, remote_listen_port) = match read_msg(&mut r).await {
+            Ok(Message::Hello { device_id, name, proto, pairing, listen_port }) => {
                 if proto != PROTO_VERSION {
                     warn!("Incompatible protocol version: {}", proto);
                     return;
                 }
-                (device_id, name, pairing)
+                (device_id, name, pairing, listen_port)
             }
             other => {
                 warn!("Received invalid initial message: {:?}", other);
@@ -552,8 +552,20 @@ impl SyncEngine {
             }
         };
 
-        let remote_name = remote_hello.1;
-        let pairing_mode = !is_paired || remote_hello.2;
+        // Learn remote peer and cache into discovered_peers
+        let incoming_discovered = DiscoveredPeer {
+            device_id: remote_id.clone(),
+            device_name: remote_name.clone(),
+            port: remote_listen_port,
+            addresses: vec![SocketAddr::new(conn.peer_addr.ip(), remote_listen_port)],
+        };
+        {
+            let mut disc = self.discovered_peers.lock().await;
+            disc.insert(remote_id.clone(), incoming_discovered.clone());
+        }
+        let _ = self.events_tx.send(SyncEvent::PeerDiscovered(incoming_discovered));
+
+        let pairing_mode = !is_paired || pairing_requested;
 
         if pairing_mode {
             let peer_ip = conn.peer_addr.ip().to_string();

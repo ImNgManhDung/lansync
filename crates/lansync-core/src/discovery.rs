@@ -41,22 +41,36 @@ impl DiscoveryService {
         properties.insert("device_name".to_string(), device_name.to_string());
         properties.insert("proto".to_string(), "1".to_string());
 
+        // Gather all physical non-loopback IP addresses for explicit mDNS advertisement
+        let ip_addrs: Vec<String> = if_addrs::get_if_addrs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|i| !i.is_loopback())
+            .map(|i| i.addr.ip().to_string())
+            .collect();
+        let ip_csv = ip_addrs.join(",");
+
+        if !ip_csv.is_empty() {
+            properties.insert("ip".to_string(), ip_csv.clone());
+        }
+
         let my_service = ServiceInfo::new(
             SERVICE_TYPE,
             instance_name,
             &host_name,
-            "", // Empty string allows mdns-sd to auto-detect local network IPs
+            ip_csv.as_str(),
             port,
             properties,
         )
-        .context("Failed to create mDNS ServiceInfo")?;
+        .context("Failed to create mDNS ServiceInfo")?
+        .enable_addr_auto();
 
         let fullname = my_service.get_fullname().to_string();
         self.daemon
             .register(my_service)
             .context("Failed to register mDNS service")?;
         self.service_fullname = Some(fullname);
-        info!("Registered mDNS service for {}", self.self_id);
+        info!("Registered mDNS service for {} (IPs: {})", self.self_id, ip_csv);
         Ok(())
     }
 
@@ -94,8 +108,19 @@ impl DiscoveryService {
                             .unwrap_or("Unknown")
                             .to_string();
                         let port = info.get_port();
-                        let mut filtered_ips: Vec<_> = info
-                            .get_addresses()
+
+                        let mut raw_ips: Vec<std::net::IpAddr> = info.get_addresses().iter().copied().collect();
+
+                        // Fallback: If mDNS A-record resolution returned no addresses, extract from TXT "ip" property
+                        if let (true, Some(ip_prop)) = (raw_ips.is_empty(), info.get_property_val_str("ip")) {
+                            for s in ip_prop.split(',') {
+                                if let Ok(ip) = s.trim().parse::<std::net::IpAddr>() {
+                                    raw_ips.push(ip);
+                                }
+                            }
+                        }
+
+                        let mut filtered_ips: Vec<_> = raw_ips
                             .iter()
                             .filter(|a| is_lan_routable_address(a))
                             .copied()
@@ -103,8 +128,7 @@ impl DiscoveryService {
 
                         // Fallback if all were filtered out
                         if filtered_ips.is_empty() {
-                            filtered_ips = info
-                                .get_addresses()
+                            filtered_ips = raw_ips
                                 .iter()
                                 .filter(|a| !a.is_loopback() && !a.is_unspecified())
                                 .copied()
@@ -126,6 +150,7 @@ impl DiscoveryService {
                             addresses,
                         };
 
+                        info!("Discovered LAN peer: {} ({}) addrs: {:?}", peer.device_name, peer.device_id, peer.addresses);
                         let _ = tx.send(peer);
                     }
                     ServiceEvent::ServiceRemoved(_, _) => {}

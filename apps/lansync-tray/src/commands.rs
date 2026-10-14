@@ -45,9 +45,13 @@ pub async fn open_sync_folder(state: State<'_, Arc<AppState>>) -> Result<(), Str
 
 #[tauri::command]
 pub async fn pair_device(addr: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let socket_addr: SocketAddr = addr
-        .parse()
-        .map_err(|e| format!("Invalid address (example: 192.168.1.10:42424): {}", e))?;
+    let clean_addr = addr.trim();
+    let socket_addr: SocketAddr = if clean_addr.contains(':') {
+        clean_addr.parse()
+    } else {
+        format!("{}:{}", clean_addr, state.listen_port).parse()
+    }
+    .map_err(|e| format!("Invalid address (example: 192.168.1.10:42424 or 192.168.1.10): {}", e))?;
 
     state
         .engine
@@ -58,7 +62,7 @@ pub async fn pair_device(addr: String, state: State<'_, Arc<AppState>>) -> Resul
     state
         .add_activity(ActivityItem::new(
             "Connecting for Pairing",
-            format!("Sent request to {}", addr),
+            format!("Sent request to {}", socket_addr),
             "peer",
         ))
         .await;

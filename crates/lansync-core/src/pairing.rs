@@ -130,7 +130,11 @@ impl PairingLimiter {
     }
 
     pub fn default_policy() -> Self {
-        Self::new(3, std::time::Duration::from_secs(90), std::time::Duration::from_secs(300))
+        Self::new(10, std::time::Duration::from_secs(90), std::time::Duration::from_secs(30))
+    }
+
+    pub fn reset(&mut self, peer_key: &str) {
+        self.attempts.remove(peer_key);
     }
 
     pub fn code_ttl(&self) -> std::time::Duration {
