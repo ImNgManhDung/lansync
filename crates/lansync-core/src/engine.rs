@@ -983,6 +983,10 @@ impl SyncEngine {
                 let (decision_tx, decision_rx) = oneshot::channel();
                 {
                     let mut pend = self.pending_pairings.lock().await;
+                    if pend.contains_key(&peer_id) {
+                        info!("Pairing handshake already pending for peer {}, ignoring duplicate incoming attempt", peer_id);
+                        return;
+                    }
                     pend.insert(peer_id.clone(), (code.clone(), decision_tx));
                 }
 
