@@ -105,7 +105,7 @@ fn configure_tcp_socket(tcp: &TcpStream) -> Result<()> {
     let mut keepalive = socket2::TcpKeepalive::new();
     keepalive = keepalive.with_time(Duration::from_secs(20));
     keepalive = keepalive.with_interval(Duration::from_secs(10));
-    #[cfg(not(target_os = "openbsd"))]
+    #[cfg(all(unix, not(target_os = "openbsd")))]
     {
         keepalive = keepalive.with_retries(3);
     }
