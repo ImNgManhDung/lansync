@@ -662,6 +662,36 @@ body {
   color: var(--success);
 }
 
+.peer-badge.connecting {
+  background: rgba(234, 136, 0, 0.12);
+  color: #ea8800;
+  border: 1px solid rgba(234, 136, 0, 0.25);
+  animation: pulse-badge 1.8s infinite;
+}
+
+.peer-badge.backoff {
+  background: rgba(142, 142, 147, 0.15);
+  color: #8e8e93;
+  border: 1px solid rgba(142, 142, 147, 0.2);
+}
+
+.peer-badge.paired {
+  background: rgba(52, 199, 89, 0.12);
+  color: #34c759;
+  border: 1px solid rgba(52, 199, 89, 0.25);
+}
+
+.peer-badge.offline {
+  background: rgba(142, 142, 147, 0.1);
+  color: #8e8e93;
+}
+
+@keyframes pulse-badge {
+  0% { opacity: 0.65; }
+  50% { opacity: 1; }
+  100% { opacity: 0.65; }
+}
+
 .peer-badge.discovered {
   background: var(--accent-soft);
   color: var(--accent);

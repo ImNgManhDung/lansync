@@ -145,6 +145,7 @@ pub struct PeerItem {
     pub cert_fingerprint: String,
     pub last_addr: Option<String>,
     pub is_connected: bool,
+    pub status: String,
     pub delete_mode: Option<String>,
 }
 
@@ -152,21 +153,22 @@ pub struct PeerItem {
 pub async fn list_peers(state: State<'_, Arc<AppState>>) -> Result<Vec<PeerItem>, String> {
     let peers = state.engine.list_peers().await;
     let connected = state.engine.connected_peer_ids().await;
-    Ok(peers
-        .into_iter()
-        .map(|p| {
-            let is_connected = connected.contains(&p.device_id);
-            let delete_mode = p.delete_mode.map(format_delete_mode);
-            PeerItem {
-                device_id: p.device_id,
-                name: p.name,
-                cert_fingerprint: p.cert_fingerprint,
-                last_addr: p.last_addr,
-                is_connected,
-                delete_mode,
-            }
-        })
-        .collect())
+    let mut items = Vec::new();
+    for p in peers {
+        let is_connected = connected.contains(&p.device_id);
+        let status = state.engine.get_peer_status(&p.device_id).await.to_string();
+        let delete_mode = p.delete_mode.map(format_delete_mode);
+        items.push(PeerItem {
+            device_id: p.device_id,
+            name: p.name,
+            cert_fingerprint: p.cert_fingerprint,
+            last_addr: p.last_addr,
+            is_connected,
+            status,
+            delete_mode,
+        });
+    }
+    Ok(items)
 }
 
 #[tauri::command]

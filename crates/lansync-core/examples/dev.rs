@@ -131,6 +131,9 @@ async fn main() -> Result<()> {
                 SyncEvent::PendingDeletion { peer_id, rel_path } => {
                     println!("[PENDING DELETION] Peer {} deleted file {}. Confirmation needed.", peer_id, rel_path);
                 }
+                SyncEvent::PeerStatusChanged { peer_id, status } => {
+                    println!("[STATUS] Peer {} status: {}", peer_id, status);
+                }
                 SyncEvent::Error(err) => {
                     eprintln!("[ERROR] {}", err);
                 }

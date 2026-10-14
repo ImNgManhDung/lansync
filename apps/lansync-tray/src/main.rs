@@ -156,6 +156,13 @@ fn main() {
                             format!("Peer {} requested deletion of {}", peer_id, rel_path),
                             "file",
                         )),
+                        SyncEvent::PeerStatusChanged { peer_id, status } => {
+                            let _ = app_handle_events.emit(
+                                "peer_status",
+                                serde_json::json!({ "peer_id": peer_id, "status": status.to_string() }),
+                            );
+                            None
+                        }
                         SyncEvent::Error(err) => Some(ActivityItem::new(
                             "System Error",
                             err.clone(),

@@ -99,11 +99,25 @@ pub fn client_config(id: &Identity) -> Result<Arc<ClientConfig>> {
     Ok(Arc::new(cfg))
 }
 
+fn configure_tcp_socket(tcp: &TcpStream) -> Result<()> {
+    tcp.set_nodelay(true)?;
+    let sock = socket2::SockRef::from(tcp);
+    let mut keepalive = socket2::TcpKeepalive::new();
+    keepalive = keepalive.with_time(Duration::from_secs(20));
+    keepalive = keepalive.with_interval(Duration::from_secs(10));
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        keepalive = keepalive.with_retries(3);
+    }
+    let _ = sock.set_tcp_keepalive(&keepalive);
+    Ok(())
+}
+
 pub async fn connect(addr: SocketAddr, cfg: Arc<ClientConfig>) -> Result<SecureConn> {
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
         .await
         .context("connection timed out")??;
-    tcp.set_nodelay(true)?;
+    configure_tcp_socket(&tcp)?;
     let name = ServerName::try_from("lansync.local")?.to_owned();
     let tls = TlsConnector::from(cfg).connect(name, tcp).await?;
     let peer_cert = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| c.to_vec())
@@ -112,7 +126,7 @@ pub async fn connect(addr: SocketAddr, cfg: Arc<ClientConfig>) -> Result<SecureC
 }
 
 pub async fn accept(tcp: TcpStream, cfg: Arc<ServerConfig>) -> Result<SecureConn> {
-    tcp.set_nodelay(true)?;
+    configure_tcp_socket(&tcp)?;
     let peer_addr = tcp.peer_addr()?;
     let tls = TlsAcceptor::from(cfg).accept(tcp).await?;
     let peer_cert = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| c.to_vec())

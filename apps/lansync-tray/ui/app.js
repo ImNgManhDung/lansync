@@ -78,9 +78,9 @@ async function init() {
   await refreshVersions();
   await setupSyncEventSubscriber();
 
-  // Periodic polling for status sync
-  setInterval(refreshStatus, 1500);
-  setInterval(refreshVersions, 5000);
+  // Lightweight fallback polling (UI is driven by real-time events)
+  setInterval(refreshStatus, 30000);
+  setInterval(refreshVersions, 10000);
 }
 
 // Tab Switching
@@ -290,6 +290,25 @@ async function setupSyncEventSubscriber() {
     const data = event.payload;
     handleSyncEvent(data);
   });
+
+  await listen('peer_status', (event) => {
+    const payload = event.payload || {};
+    const peerId = payload.peer_id;
+    const status = payload.status;
+    if (!peerId) return;
+
+    if (pairedPeersMap.has(peerId)) {
+      const p = pairedPeersMap.get(peerId);
+      p.status = status;
+      p.is_connected = (status === 'connected');
+    }
+    if (knownPeers.has(peerId)) {
+      const p = knownPeers.get(peerId);
+      p.status = status;
+      p.connected = (status === 'connected');
+    }
+    renderPeers();
+  });
 }
 
 function handleSyncEvent(event) {
@@ -312,25 +331,42 @@ function handleSyncEvent(event) {
     const { peer_id, device_name } = event.PeerConnected;
     const existing = knownPeers.get(peer_id) || { device_id: peer_id, device_name, addresses: [] };
     existing.connected = true;
+    existing.status = 'connected';
     knownPeers.set(peer_id, existing);
     if (pairedPeersMap.has(peer_id)) {
-      pairedPeersMap.get(peer_id).is_connected = true;
+      const p = pairedPeersMap.get(peer_id);
+      p.is_connected = true;
+      p.status = 'connected';
     }
     renderPeers();
     setSyncState('idle');
-    refreshPeers();
   } else if (event.PeerDisconnected) {
     const { peer_id } = event.PeerDisconnected;
     const existing = knownPeers.get(peer_id);
     if (existing) {
       existing.connected = false;
+      existing.status = 'backoff';
     }
     if (pairedPeersMap.has(peer_id)) {
-      pairedPeersMap.get(peer_id).is_connected = false;
+      const p = pairedPeersMap.get(peer_id);
+      p.is_connected = false;
+      p.status = 'backoff';
     }
     renderPeers();
     setSyncState('idle');
-    refreshPeers();
+  } else if (event.PeerStatusChanged) {
+    const { peer_id, status } = event.PeerStatusChanged;
+    if (pairedPeersMap.has(peer_id)) {
+      const p = pairedPeersMap.get(peer_id);
+      p.status = status;
+      p.is_connected = (status === 'connected');
+    }
+    if (knownPeers.has(peer_id)) {
+      const p = knownPeers.get(peer_id);
+      p.status = status;
+      p.connected = (status === 'connected');
+    }
+    renderPeers();
   } else if (event.FileDownloading) {
     const { rel_path, size } = event.FileDownloading;
     setSyncState('syncing');
@@ -526,6 +562,7 @@ function renderPeers() {
       device_name: p.name,
       is_paired: true,
       connected: p.is_connected,
+      status: p.status || (p.is_connected ? 'connected' : 'offline'),
       addresses: p.last_addr ? [p.last_addr] : [],
       delete_mode: p.delete_mode || null,
     });
@@ -537,12 +574,14 @@ function renderPeers() {
         device_name: p.device_name,
         is_paired: false,
         connected: !!p.connected,
+        status: p.status || (p.connected ? 'connected' : 'discovered'),
         addresses: p.addresses || [],
         delete_mode: null,
       });
     } else {
       const existing = allMap.get(id);
       if (p.connected) existing.connected = true;
+      if (p.status) existing.status = p.status;
       if (p.addresses && p.addresses.length) existing.addresses = p.addresses;
     }
   }
@@ -583,8 +622,27 @@ function renderPeers() {
   elPeersList.innerHTML = peers.map(p => {
     const isConn = !!p.connected;
     const isPaired = !!p.is_paired;
-    const badgeText = isConn ? 'Đang kết nối' : (isPaired ? 'Đã ghép' : 'Ghép đôi');
-    const badgeClass = isConn ? 'connected' : (isPaired ? 'paired' : 'discovered');
+    let badgeText = 'Ghép đôi';
+    let badgeClass = 'discovered';
+
+    if (isConn || p.status === 'connected') {
+      badgeText = 'Đã kết nối';
+      badgeClass = 'connected';
+    } else if (p.status === 'connecting') {
+      badgeText = 'Đang nối...';
+      badgeClass = 'connecting';
+    } else if (p.status === 'backoff') {
+      badgeText = 'Chờ thử lại...';
+      badgeClass = 'backoff';
+    } else if (isPaired) {
+      if (p.status === 'offline') {
+        badgeText = 'Ngoại tuyến';
+        badgeClass = 'offline';
+      } else {
+        badgeText = 'Đã ghép';
+        badgeClass = 'paired';
+      }
+    }
     const firstAddr = p.addresses && p.addresses.length > 0 ? p.addresses[0] : '';
 
     return `
