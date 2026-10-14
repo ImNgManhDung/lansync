@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LanSync</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+        </svg>
+        <span class="brand-title">LanSync</span>
+      </div>
+      <div class="header-actions">
+        <button id="btn-open-folder" class="icon-btn" title="Open sync folder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+          </svg>
+        </button>
+        <button id="btn-toggle-settings" class="icon-btn" title="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="app-main">
+      <!-- Status Card -->
+      <section class="card status-card">
+        <div class="status-header">
+          <div class="status-indicator">
+            <span id="status-dot" class="dot dot-online"></span>
+            <span id="status-text" class="status-label">Active</span>
+          </div>
+          <span id="device-id-badge" class="device-id" title="Click to copy Device ID">ID: ...</span>
+        </div>
+        
+        <div class="device-info">
+          <div class="device-name" id="device-name">Local Device</div>
+          <div class="folder-path" id="folder-path" title="Sync folder">~/LanSync</div>
+        </div>
+
+        <!-- Sync Progress (hidden when idle) -->
+        <div id="sync-progress-box" class="sync-progress-box hidden">
+          <div class="progress-info">
+            <span id="progress-filename" class="progress-file">syncing_file.dat</span>
+            <span id="progress-percent" class="progress-stat">Downloading...</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div id="progress-bar-fill" class="progress-bar-fill"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Pairing Request Alert -->
+      <section id="pairing-card" class="card pairing-card hidden">
+        <div class="pairing-title">New Pairing Request</div>
+        <div class="pairing-desc">Device <strong id="pairing-peer-name">Remote Device</strong> wants to connect over LAN.</div>
+        <div class="pairing-code-container">
+          <div class="code-label">CONFIRMATION CODE</div>
+          <div id="pairing-code-display" class="code-box">------</div>
+        </div>
+        <div class="pairing-actions">
+          <button id="btn-approve-pairing" class="btn btn-primary">Approve</button>
+          <button id="btn-reject-pairing" class="btn btn-secondary">Reject</button>
+        </div>
+      </section>
+
+      <!-- Discovered Peers Section -->
+      <section class="section-container">
+        <div class="section-header">
+          <span class="section-title">LAN Devices</span>
+          <span id="peers-count" class="badge">0</span>
+        </div>
+        <div id="peers-list" class="peers-list">
+          <div class="empty-state">Searching for devices on LAN...</div>
+        </div>
+      </section>
+
+      <!-- Recent Activities Stream -->
+      <section class="section-container activity-section">
+        <div class="section-header">
+          <span class="section-title">Recent Activity</span>
+        </div>
+        <div id="activities-list" class="activities-list">
+          <div class="empty-state">No recent activity</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Settings Slide-in View -->
+    <div id="settings-view" class="settings-overlay hidden">
+      <div class="settings-content">
+        <div class="settings-header">
+          <span class="settings-title">LanSync Settings</span>
+          <button id="btn-close-settings" class="icon-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+
+        <div class="settings-body">
+          <div class="form-group">
+            <label>Sync Folder</label>
+            <div class="input-with-button">
+              <input type="text" id="setting-sync-dir" readonly />
+              <button id="btn-browse-folder" class="btn btn-sm">Browse...</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Manual Connection (IP:Port)</label>
+            <div class="input-with-button">
+              <input type="text" id="manual-ip-input" placeholder="192.168.1.10:42424" />
+              <button id="btn-manual-pair" class="btn btn-sm btn-primary">Connect</button>
+            </div>
+          </div>
+
+          <div class="settings-meta">
+            <div>Version: <strong>0.1.0 (Core Engine v1)</strong></div>
+            <div>Security: <strong>TLS 1.3 Ed25519 P2P</strong></div>
+            <div>Mode: <strong>Local LAN / Zero Cloud</strong></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

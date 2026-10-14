@@ -1,0 +1,25 @@
+[package]
+name = "lansync-tray"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+lansync-core = { path = "../../crates/lansync-core" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+open = "5"
+directories = "6"
+chrono = "0.4"
+rand = "0.8"
+rfd = "0.15"

@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/lansync-core",
+    "apps/lansync-tray",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"

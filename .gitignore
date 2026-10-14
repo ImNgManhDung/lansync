@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.DS_Store
+test_data/
+test_folders/
+.lansync*
+LanSync_Folder/
