@@ -42,6 +42,9 @@ async function init() {
   setupEventListeners();
   await refreshStatus();
   setupSyncEventSubscriber();
+
+  // Periodic polling to keep UI status synchronized
+  setInterval(refreshStatus, 1500);
 }
 
 function setupEventListeners() {
@@ -68,9 +71,8 @@ function setupEventListeners() {
 
   // Pairing - Approve
   elBtnApprovePairing.addEventListener('click', async () => {
-    if (!currentPairingPeerId) return;
     try {
-      await invoke('approve_pairing', { peerId: currentPairingPeerId });
+      await invoke('approve_pairing', { peerId: currentPairingPeerId || null });
       hidePairingCard();
       await refreshStatus();
     } catch (err) {
@@ -80,10 +82,10 @@ function setupEventListeners() {
 
   // Pairing - Reject
   elBtnRejectPairing.addEventListener('click', async () => {
-    if (!currentPairingPeerId) return;
     try {
-      await invoke('reject_pairing', { peerId: currentPairingPeerId });
+      await invoke('reject_pairing', { peerId: currentPairingPeerId || null });
       hidePairingCard();
+      await refreshStatus();
     } catch (err) {
       console.error('Error:', err);
     }
@@ -108,6 +110,7 @@ function setupEventListeners() {
       await invoke('pair_device', { addr });
       elManualIpInput.value = '';
       elSettingsView.classList.add('hidden');
+      await refreshStatus();
     } catch (err) {
       alert('Failed to connect: ' + err);
     } finally {
@@ -140,6 +143,17 @@ async function refreshStatus() {
     elDeviceId.innerText = `ID: ${status.device_id.substring(0, 8)}...`;
     elFolderPath.innerText = status.sync_dir;
     elSettingSyncDir.value = status.sync_dir;
+
+    // Check for pending pairing request
+    if (status.pending_pairing) {
+      showPairingCard(
+        status.pending_pairing.peer_id,
+        status.pending_pairing.device_name,
+        status.pending_pairing.code
+      );
+    } else if (currentPairingPeerId) {
+      hidePairingCard();
+    }
 
     renderActivities(status.activities || []);
   } catch (err) {

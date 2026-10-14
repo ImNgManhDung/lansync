@@ -7,6 +7,13 @@ use tokio::sync::Mutex;
 use lansync_core::engine::SyncEngine;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPairingInfo {
+    pub peer_id: String,
+    pub device_name: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityItem {
     pub id: String,
     pub timestamp: String,
@@ -37,6 +44,7 @@ pub struct AppState {
     pub device_name: String,
     pub listen_port: u16,
     pub activities: Arc<Mutex<Vec<ActivityItem>>>,
+    pub pending_pairing: Arc<Mutex<Option<PendingPairingInfo>>>,
 }
 
 impl AppState {

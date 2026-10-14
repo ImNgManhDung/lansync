@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tauri::State;
 
-use crate::state::{ActivityItem, AppState};
+use crate::state::{ActivityItem, AppState, PendingPairingInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
@@ -12,17 +12,20 @@ pub struct StatusResponse {
     pub sync_dir: String,
     pub listen_port: u16,
     pub activities: Vec<ActivityItem>,
+    pub pending_pairing: Option<PendingPairingInfo>,
 }
 
 #[tauri::command]
 pub async fn get_status(state: State<'_, Arc<AppState>>) -> Result<StatusResponse, String> {
     let activities = state.activities.lock().await.clone();
+    let pending_pairing = state.pending_pairing.lock().await.clone();
     Ok(StatusResponse {
         device_id: state.engine.local_device_id().to_string(),
         device_name: state.device_name.clone(),
         sync_dir: state.sync_dir.to_string_lossy().to_string(),
         listen_port: state.listen_port,
         activities,
+        pending_pairing,
     })
 }
 
@@ -56,17 +59,27 @@ pub async fn pair_device(addr: String, state: State<'_, Arc<AppState>>) -> Resul
 }
 
 #[tauri::command]
-pub async fn approve_pairing(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn approve_pairing(peer_id: Option<String>, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let target_id = if let Some(id) = peer_id.filter(|s| !s.is_empty()) {
+        id
+    } else if let Some(ref p) = *state.pending_pairing.lock().await {
+        p.peer_id.clone()
+    } else {
+        return Err("No pending pairing request found".into());
+    };
+
     state
         .engine
-        .approve_pairing(&peer_id)
+        .approve_pairing(&target_id)
         .await
         .map_err(|e| format!("Failed to approve pairing: {}", e))?;
+
+    *state.pending_pairing.lock().await = None;
 
     state
         .add_activity(ActivityItem::new(
             "Pairing Approved",
-            format!("Device: {}", peer_id),
+            format!("Device: {}", target_id),
             "peer",
         ))
         .await;
@@ -75,17 +88,27 @@ pub async fn approve_pairing(peer_id: String, state: State<'_, Arc<AppState>>) -
 }
 
 #[tauri::command]
-pub async fn reject_pairing(peer_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn reject_pairing(peer_id: Option<String>, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let target_id = if let Some(id) = peer_id.filter(|s| !s.is_empty()) {
+        id
+    } else if let Some(ref p) = *state.pending_pairing.lock().await {
+        p.peer_id.clone()
+    } else {
+        return Err("No pending pairing request found".into());
+    };
+
     state
         .engine
-        .reject_pairing(&peer_id)
+        .reject_pairing(&target_id)
         .await
         .map_err(|e| format!("Failed to reject pairing: {}", e))?;
+
+    *state.pending_pairing.lock().await = None;
 
     state
         .add_activity(ActivityItem::new(
             "Pairing Rejected",
-            format!("Device: {}", peer_id),
+            format!("Device: {}", target_id),
             "peer",
         ))
         .await;

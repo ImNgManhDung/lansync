@@ -13,7 +13,7 @@ use tracing::info;
 
 use lansync_core::config::Config;
 use lansync_core::engine::{SyncEngine, SyncEvent};
-use state::{ActivityItem, AppState};
+use state::{ActivityItem, AppState, PendingPairingInfo};
 
 fn main() {
     let subscriber = tracing_subscriber::fmt()
@@ -50,6 +50,7 @@ fn main() {
         device_name,
         listen_port,
         activities: Arc::new(Mutex::new(Vec::new())),
+        pending_pairing: Arc::new(Mutex::new(None)),
     });
 
     let app_state_for_events = app_state.clone();
@@ -80,6 +81,25 @@ fn main() {
             let app_handle_events = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(event) = rx_events.recv().await {
+                    match &event {
+                        SyncEvent::PairingRequested { peer_id, device_name, code } => {
+                            *app_state_for_events.pending_pairing.lock().await = Some(PendingPairingInfo {
+                                peer_id: peer_id.clone(),
+                                device_name: device_name.clone(),
+                                code: code.clone(),
+                            });
+                            // Automatically show and focus the window when a pairing request arrives!
+                            if let Some(w) = app_handle_events.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        SyncEvent::PairingAccepted { .. } | SyncEvent::PairingRejected { .. } => {
+                            *app_state_for_events.pending_pairing.lock().await = None;
+                        }
+                        _ => {}
+                    }
+
                     let activity_opt = match &event {
                         SyncEvent::PeerDiscovered(p) => Some(ActivityItem::new(
                             "Device Discovered",

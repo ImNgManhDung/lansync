@@ -265,7 +265,7 @@ impl SyncEngine {
         Ok(())
     }
 
-    pub async fn handle_connection(self: Arc<Self>, conn: SecureConn, _is_incoming: bool) {
+    pub async fn handle_connection(self: Arc<Self>, conn: SecureConn, is_incoming: bool) {
         let peer_cert = conn.peer_cert;
         let peer_id = device_id_from_cert(&peer_cert);
         let peer_fp = fingerprint(&peer_cert);
@@ -273,6 +273,11 @@ impl SyncEngine {
         if peer_id == self.identity.device_id {
             return;
         }
+
+        info!(
+            "Connection established with peer {} at {} (incoming: {})",
+            peer_id, conn.peer_addr, is_incoming
+        );
 
         // Split stream into Read + Write halves
         let (mut r, mut w) = tokio::io::split(conn.stream);
@@ -328,6 +333,10 @@ impl SyncEngine {
 
         if pairing_mode {
             let code = pairing_code(&self.identity.cert_der, &peer_cert);
+            info!(
+                "Pairing requested with peer {} ({}) - Confirmation Code: [{}]",
+                peer_id, remote_name, code
+            );
 
             let accepted = if cfg.auto_accept_pairing {
                 true
@@ -359,6 +368,11 @@ impl SyncEngine {
                 _ => false,
             };
 
+            info!(
+                "Pairing handshake for {}: local_accepted={}, remote_accepted={}",
+                peer_id, accepted, peer_decision
+            );
+
             if !accepted || !peer_decision {
                 info!("Pairing failed or rejected with peer {}", peer_id);
                 return;
@@ -379,6 +393,8 @@ impl SyncEngine {
                 .events_tx
                 .send(SyncEvent::PairingAccepted { peer_id: peer_id.clone() });
         }
+
+        info!("Peer {} fully authenticated and connected.", peer_id);
 
         // Successfully paired and authenticated
         {
