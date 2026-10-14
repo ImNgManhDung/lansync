@@ -242,7 +242,11 @@ impl Index {
 
         for (path, old) in known {
             if old.hash.is_some() && !seen.contains(&path) {
+                // If an active partial download (.lansync-part-*.tmp) is present, do not record a tombstone
                 if let Some(h) = old.hash {
+                    if crate::transfer::partial_download_path(&self.root, &path, &h).is_some_and(|part| part.exists()) {
+                        continue;
+                    }
                     let _ = self.record_tombstone(&path, &h);
                 }
                 let mut vv = old.vv.clone();

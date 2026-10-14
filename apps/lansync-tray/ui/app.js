@@ -646,7 +646,7 @@ function renderPeers() {
         badgeClass = 'paired';
       }
     }
-    const firstAddr = p.addresses && p.addresses.length > 0 ? p.addresses[0] : '';
+    const bestAddr = (p.addresses || []).find(a => a.includes('.')) || (p.addresses && p.addresses[0]) || '';
 
     return `
       <div class="peer-card">
@@ -660,7 +660,7 @@ function renderPeers() {
           </div>
           <div class="peer-text-box">
             <div class="peer-title">${escapeHtml(p.device_name)}</div>
-            ${firstAddr ? `<div class="peer-ip">${escapeHtml(firstAddr)}</div>` : ''}
+            ${bestAddr ? `<div class="peer-ip">${escapeHtml(bestAddr)}</div>` : ''}
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:6px;">
@@ -672,7 +672,7 @@ function renderPeers() {
               <option value="mirror_trash" ${p.delete_mode === 'mirror_trash' ? 'selected' : ''}>Thùng rác</option>
             </select>
           ` : ''}
-          <button class="peer-badge ${badgeClass}" ${!isPaired && p.addresses?.length ? `onclick="window.connectPeer('${escapeAttr(p.addresses[0])}', this)"` : ''}>
+          <button class="peer-badge ${badgeClass}" ${!isPaired && bestAddr ? `onclick="window.connectPeer('${escapeAttr(bestAddr)}', this)"` : ''}>
             ${badgeText}
           </button>
           ${isPaired ? `

@@ -243,7 +243,17 @@ impl SyncEngine {
                     while let Ok(discovered) = rx_peer.recv().await {
                         {
                             let mut disc_map = engine_disc.discovered_peers.lock().await;
-                            disc_map.insert(discovered.device_id.clone(), discovered.clone());
+                            if let Some(existing) = disc_map.get_mut(&discovered.device_id) {
+                                for addr in discovered.addresses.clone() {
+                                    if !existing.addresses.contains(&addr) {
+                                        existing.addresses.push(addr);
+                                    }
+                                }
+                                existing.device_name = discovered.device_name.clone();
+                                existing.port = discovered.port;
+                            } else {
+                                disc_map.insert(discovered.device_id.clone(), discovered.clone());
+                            }
                         }
 
                         let _ = engine_disc
@@ -261,7 +271,7 @@ impl SyncEngine {
 
                         if !is_connected {
                             if is_paired {
-                                engine_disc.reconnect_notify.notify_waiters();
+                                engine_disc.reconnect_notify.notify_one();
                             } else {
                                 engine_disc
                                     .set_peer_status(&discovered.device_id, PeerStatus::Discovered)
@@ -298,28 +308,34 @@ impl SyncEngine {
         tokio::spawn(async move {
             let mut attempts: HashMap<String, u32> = HashMap::new();
             let mut next_retry: HashMap<String, tokio::time::Instant> = HashMap::new();
+            let dials_in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
+            let mut first_run = true;
             loop {
-                let now = tokio::time::Instant::now();
-                let earliest_retry = next_retry.values().min().copied();
-                let sleep_duration = match earliest_retry {
-                    Some(t) if t > now => t - now,
-                    Some(_) => Duration::from_millis(50),
-                    None => Duration::from_secs(60),
-                };
+                if first_run {
+                    first_run = false;
+                } else {
+                    let now = tokio::time::Instant::now();
+                    let earliest_retry = next_retry.values().min().copied();
+                    let sleep_duration = match earliest_retry {
+                        Some(t) if t > now => t - now,
+                        Some(_) => Duration::from_millis(50),
+                        None => Duration::from_secs(60),
+                    };
 
-                tokio::select! {
-                    _ = engine_reconnect.shutdown_notify.notified() => {
-                        break;
-                    }
-                    _ = engine_reconnect.reconnect_notify.notified() => {
-                        // Event-driven: peer discovered, network changed, or pairing approved!
-                        // Reset backoff delay for peers so we attempt connection immediately
-                        for t in next_retry.values_mut() {
-                            *t = tokio::time::Instant::now();
+                    tokio::select! {
+                        _ = engine_reconnect.shutdown_notify.notified() => {
+                            break;
                         }
+                        _ = engine_reconnect.reconnect_notify.notified() => {
+                            // Event-driven: peer discovered, network changed, or pairing approved!
+                            // Reset backoff delay for peers so we attempt connection immediately
+                            for t in next_retry.values_mut() {
+                                *t = tokio::time::Instant::now();
+                            }
+                        }
+                        _ = tokio::time::sleep(sleep_duration) => {}
                     }
-                    _ = tokio::time::sleep(sleep_duration) => {}
                 }
 
                 let paired_peers = engine_reconnect.peer_store.lock().await.list().to_vec();
@@ -346,16 +362,37 @@ impl SyncEngine {
                         continue;
                     }
 
+                    // Avoid duplicate dial attempts if already dialing or connecting to this peer
+                    {
+                        let in_flight = dials_in_flight.lock().await;
+                        if in_flight.contains(&peer.device_id) {
+                            continue;
+                        }
+                    }
+
                     // Check if it's time to retry this peer
                     if next_retry.get(&peer.device_id).is_some_and(|&retry_time| now < retry_time) {
                         continue;
                     }
 
-                    let addr_opt = peer.last_addr.as_ref().and_then(|a| a.parse().ok())
-                        .or_else(|| {
-                            let disc = engine_reconnect.discovered_peers.try_lock().ok()?;
-                            disc.get(&peer.device_id).and_then(|d| d.addresses.first().copied())
-                        });
+                    let addr_opt = {
+                        let disc = engine_reconnect.discovered_peers.try_lock().ok();
+                        disc.and_then(|d| d.get(&peer.device_id).and_then(|p| {
+                            p.addresses.iter().find(|a| a.is_ipv4()).copied()
+                        }))
+                    }
+                    .or_else(|| peer.last_addr.as_ref().and_then(|a| {
+                        let mut sa: SocketAddr = a.parse().ok()?;
+                        // If stored port is an ephemeral client port (>49151), fallback to default sync port
+                        if sa.port() > 49151 {
+                            sa.set_port(42424);
+                        }
+                        Some(sa)
+                    }))
+                    .or_else(|| {
+                        let disc = engine_reconnect.discovered_peers.try_lock().ok();
+                        disc.and_then(|d| d.get(&peer.device_id).and_then(|p| p.addresses.first().copied()))
+                    });
 
                     let Some(addr) = addr_opt else {
                         engine_reconnect.set_peer_status(&peer.device_id, PeerStatus::Offline).await;
@@ -365,6 +402,10 @@ impl SyncEngine {
                     let Ok(cli_cfg) = client_config(&engine_reconnect.identity) else { continue };
 
                     engine_reconnect.set_peer_status(&peer.device_id, PeerStatus::Connecting).await;
+                    dials_in_flight.lock().await.insert(peer.device_id.clone());
+
+                    let flight_tracker = dials_in_flight.clone();
+                    let peer_id_for_flight = peer.device_id.clone();
 
                     match connect(addr, cli_cfg).await {
                         Ok(conn) => {
@@ -373,9 +414,11 @@ impl SyncEngine {
                             let eng = engine_reconnect.clone();
                             tokio::spawn(async move {
                                 eng.handle_connection(conn, false).await;
+                                flight_tracker.lock().await.remove(&peer_id_for_flight);
                             });
                         }
                         Err(e) => {
+                            flight_tracker.lock().await.remove(&peer_id_for_flight);
                             let attempt = attempts.entry(peer.device_id.clone()).or_insert(0);
                             *attempt = attempt.saturating_add(1);
                             let delay = next_delay(*attempt);
@@ -466,7 +509,7 @@ impl SyncEngine {
     }
 
     pub fn trigger_reconnect(&self) {
-        self.reconnect_notify.notify_waiters();
+        self.reconnect_notify.notify_one();
     }
 
     pub async fn approve_pairing(&self, peer_id: &str) -> Result<()> {
@@ -476,7 +519,7 @@ impl SyncEngine {
             let _ = self
                 .events_tx
                 .send(SyncEvent::PairingAccepted { peer_id: peer_id.to_string() });
-            self.reconnect_notify.notify_waiters();
+            self.reconnect_notify.notify_one();
             Ok(())
         } else {
             anyhow::bail!("No pending pairing request found for device {}", peer_id)
@@ -547,7 +590,7 @@ impl SyncEngine {
             PeerStatus::Offline
         };
         self.set_peer_status(peer_id, status).await;
-        self.reconnect_notify.notify_waiters();
+        self.reconnect_notify.notify_one();
 
         if let Some(dp) = self.discovered_peers.lock().await.get(peer_id).cloned() {
             let _ = self.events_tx.send(SyncEvent::PeerDiscovered(dp));
@@ -567,7 +610,7 @@ impl SyncEngine {
             let _ = disc.register(&device_name, self.local_addr.port());
         }
         self.scan_subnet_peers().await;
-        self.reconnect_notify.notify_waiters();
+        self.reconnect_notify.notify_one();
         let peers = self.list_discovered_peers().await;
         for peer in peers {
             let _ = self.events_tx.send(SyncEvent::PeerDiscovered(peer));
@@ -676,7 +719,17 @@ impl SyncEngine {
                             };
                             {
                                 let mut disc = engine.discovered_peers.lock().await;
-                                disc.insert(device_id.clone(), peer.clone());
+                                if let Some(existing) = disc.get_mut(&device_id) {
+                                    for addr in peer.addresses.clone() {
+                                        if !existing.addresses.contains(&addr) {
+                                            existing.addresses.insert(0, addr);
+                                        }
+                                    }
+                                    existing.device_name = peer.device_name.clone();
+                                    existing.port = peer.port;
+                                } else {
+                                    disc.insert(device_id.clone(), peer.clone());
+                                }
                             }
                             info!("Subnet scan discovered peer: {} ({}) at {}", peer.device_name, peer.device_id, target_addr);
                             let _ = engine.events_tx.send(SyncEvent::PeerDiscovered(peer.clone()));
@@ -693,7 +746,7 @@ impl SyncEngine {
 
                             if !is_connected {
                                 if is_paired {
-                                    engine.reconnect_notify.notify_waiters();
+                                    engine.reconnect_notify.notify_one();
                                 } else {
                                     engine.set_peer_status(&peer.device_id, PeerStatus::Discovered).await;
                                 }
@@ -900,8 +953,8 @@ impl SyncEngine {
 
         // Pairing mode:
         // 1) Active dial for pairing: local peer initiated connection and is unpaired.
-        // 2) Incoming pairing request: remote peer initiated connection with pairing=true and is unpaired.
-        let pairing_mode = (!is_paired && !is_incoming) || (!is_paired && is_incoming && pairing_requested);
+        // 2) Incoming pairing request: remote peer requested pairing (even if local has old entry).
+        let pairing_mode = (!is_paired && !is_incoming) || (is_incoming && pairing_requested);
 
         if pairing_mode {
             let peer_ip = conn.peer_addr.ip().to_string();
@@ -976,14 +1029,15 @@ impl SyncEngine {
                 limiter.record_success(&peer_ip);
             }
 
-            // Save peer in PeerStore
+            // Save peer in PeerStore using listening address, NOT ephemeral port
+            let remote_listen_addr = SocketAddr::new(conn.peer_addr.ip(), remote_listen_port);
             {
                 let mut store = self.peer_store.lock().await;
                 store.add(Peer {
                     device_id: peer_id.clone(),
                     name: remote_name.clone(),
                     cert_fingerprint: peer_fp.clone(),
-                    last_addr: Some(conn.peer_addr.to_string()),
+                    last_addr: Some(remote_listen_addr.to_string()),
                     delete_mode: None,
                 });
                 let _ = store.save();
@@ -992,16 +1046,22 @@ impl SyncEngine {
                 .events_tx
                 .send(SyncEvent::PairingAccepted { peer_id: peer_id.clone() });
         } else if !is_paired {
-            // Neither side requested pairing and peer is not paired (e.g. subnet discovery probe).
-            // Handshake is complete, close connection cleanly.
-            debug!("Unpaired connection with peer {} completed discovery; closing session.", peer_id);
+            // Neither side requested pairing and peer is not paired.
+            // If remote connected thinking it is paired, notify it so both peers are in sync.
+            if is_incoming {
+                debug!("Unpaired incoming connection from peer {} without pairing request; notifying unpair.", peer_id);
+                let _ = tx_msg.send(Message::Unpair).await;
+            } else {
+                debug!("Unpaired connection with peer {} completed discovery; closing session.", peer_id);
+            }
             return;
         }
 
-        // Update last_addr in PeerStore
+        // Update last_addr in PeerStore with peer's listening address
+        let remote_listen_addr = SocketAddr::new(conn.peer_addr.ip(), remote_listen_port);
         {
             let mut store = self.peer_store.lock().await;
-            store.set_addr(&peer_id, &conn.peer_addr.to_string());
+            store.set_addr(&peer_id, &remote_listen_addr.to_string());
             let _ = store.save();
         }
 
@@ -1028,6 +1088,13 @@ impl SyncEngine {
             if !am_dialer && !is_incoming {
                 info!(
                     "Tie-breaker: Dropping outgoing connection to {} because remote peer is active dialer",
+                    peer_id
+                );
+                return;
+            }
+            if am_dialer && !is_incoming {
+                info!(
+                    "Tie-breaker: Dropping duplicate outgoing connection to {} because connection is already active",
                     peer_id
                 );
                 return;
@@ -1086,7 +1153,7 @@ impl SyncEngine {
         loop {
             let msg = tokio::select! {
                 biased;
-                _ = &mut cancel_rx => {
+                Ok(()) = &mut cancel_rx => {
                     info!("Connection cancelled locally for peer {}", peer_id);
                     break;
                 }
@@ -1113,7 +1180,7 @@ impl SyncEngine {
                             m
                         }
                         Err(e) => {
-                            debug!("Peer {} read error or disconnected: {:?}", peer_id, e);
+                            info!("Peer {} disconnected / read error: {:?}", peer_id, e);
                             break;
                         }
                     }
@@ -1151,6 +1218,7 @@ impl SyncEngine {
                     break;
                 }
                 Message::Index { entries } => {
+                    info!("Received full Index from peer {} with {} entries", peer_id, entries.len());
                     remote_entries.clear();
                     for e in entries {
                         remote_entries.insert(e.path.clone(), e);
@@ -1164,6 +1232,7 @@ impl SyncEngine {
                     .await;
                 }
                 Message::IndexUpdate { entries } => {
+                    info!("Received IndexUpdate from peer {} with {} entries", peer_id, entries.len());
                     for e in entries {
                         remote_entries.insert(e.path.clone(), e);
                     }
@@ -1285,7 +1354,7 @@ impl SyncEngine {
                 peer_id: peer_id.clone(),
             });
 
-            self.reconnect_notify.notify_waiters();
+            self.reconnect_notify.notify_one();
         }
         drop(tx_msg);
         let _ = writer_task.await;
@@ -1302,7 +1371,8 @@ impl SyncEngine {
             return;
         }
 
-        let (local_entries, bases, tombstones) = {
+        let sync_dir = self.config.read().await.sync_dir.clone();
+        let (local_entries, bases, mut tombstones) = {
             let db = self.index_db.lock().await;
             (
                 db.entries().unwrap_or_default(),
@@ -1310,6 +1380,15 @@ impl SyncEngine {
                 db.tombstones().unwrap_or_default(),
             )
         };
+
+        // Filter out tombstones if an in-progress partial download (.lansync-part-*.tmp) exists on disk
+        tombstones.retain(|path, hash| {
+            if let Some(part) = crate::transfer::partial_download_path(&sync_dir, path, hash) {
+                !part.exists()
+            } else {
+                true
+            }
+        });
 
         let my_id = self.identity.device_id.clone();
         let i_win = my_id.as_str() < peer_id;
@@ -1336,6 +1415,7 @@ impl SyncEngine {
             stamp: &stamp,
             delete_mode,
         });
+        info!("execute_plan with peer {}: planned {} actions: {:?}", peer_id, actions.len(), actions);
 
         let sync_dir = self.config.read().await.sync_dir.clone();
 
