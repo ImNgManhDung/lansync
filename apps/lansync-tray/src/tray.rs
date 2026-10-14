@@ -18,14 +18,16 @@ pub fn setup_tray(app: &AppHandle, state: Arc<AppState>) -> anyhow::Result<()> {
         .item(&quit_item)
         .build()?;
 
-    let mut builder = TrayIconBuilder::with_id("main-tray")
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .unwrap_or_else(|| tauri::include_image!("icons/32x32.png"));
+
+    let builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("LanSync - Local Network Sync")
+        .icon(icon)
         .menu(&menu)
         .show_menu_on_left_click(false);
-
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
 
     let state_for_menu = state.clone();
     builder
