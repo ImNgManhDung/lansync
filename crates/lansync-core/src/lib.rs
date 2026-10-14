@@ -10,4 +10,6 @@ pub mod planner;
 pub mod protocol;
 pub mod transfer;
 pub mod transport;
+pub mod version_vector;
+pub mod versioning;
 pub mod watcher;

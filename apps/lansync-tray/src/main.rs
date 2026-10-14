@@ -146,6 +146,16 @@ fn main() {
                             "Data is up to date",
                             "sync",
                         )),
+                        SyncEvent::FileTrashed { rel_path, .. } => Some(ActivityItem::new(
+                            "Moved to Trash",
+                            rel_path.clone(),
+                            "file",
+                        )),
+                        SyncEvent::PendingDeletion { peer_id, rel_path } => Some(ActivityItem::new(
+                            "Pending Deletion",
+                            format!("Peer {} requested deletion of {}", peer_id, rel_path),
+                            "file",
+                        )),
                         SyncEvent::Error(err) => Some(ActivityItem::new(
                             "System Error",
                             err.clone(),
@@ -173,6 +183,25 @@ fn main() {
             commands::approve_pairing,
             commands::reject_pairing,
             commands::pick_sync_folder,
+            commands::list_peers,
+            commands::list_discovered_peers,
+            commands::rescan_peers,
+            commands::unpair_device,
+            commands::list_conflicts,
+            commands::resolve_conflict,
+            commands::get_delete_mode,
+            commands::set_delete_mode,
+            commands::set_peer_delete_mode,
+            commands::list_pending_deletions,
+            commands::resolve_pending_deletion,
+            commands::list_versioned_files,
+            commands::list_file_versions,
+            commands::restore_file_version,
+            commands::is_sync_paused,
+            commands::set_sync_paused,
+            commands::get_bandwidth_limit,
+            commands::set_bandwidth_limit,
+            commands::trigger_manual_sync,
         ])
         .run(tauri::generate_context!())
         .expect("error running tauri application");

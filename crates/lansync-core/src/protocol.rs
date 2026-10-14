@@ -10,6 +10,8 @@ pub const INDEX_BATCH: usize = 5_000;
 
 pub type Hash = [u8; 32];
 
+use crate::version_vector::VersionVector;
+
 /// A file entry in the index. `hash = None` means the file was deleted locally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -17,6 +19,25 @@ pub struct Entry {
     pub size: u64,
     pub mtime_ns: i64,
     pub hash: Option<Hash>,
+    #[serde(default)]
+    pub vv: VersionVector,
+}
+
+impl Entry {
+    pub fn simple(path: impl Into<String>, size: u64, mtime_ns: i64, hash: Option<Hash>) -> Self {
+        Self {
+            path: path.into(),
+            size,
+            mtime_ns,
+            hash,
+            vv: VersionVector::default(),
+        }
+    }
+
+    pub fn with_vv(mut self, vv: VersionVector) -> Self {
+        self.vv = vv;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,12 +47,15 @@ pub enum Message {
     Index { entries: Vec<Entry> },
     IndexUpdate { entries: Vec<Entry> },
     GetFile { path: String, hash: Hash },
+    GetFileRange { path: String, hash: Hash, offset: u64 },
     FileHeader { path: String, size: u64, hash: Hash, mtime_ns: i64 },
+    FileHeaderRange { path: String, size: u64, hash: Hash, mtime_ns: i64, offset: u64 },
     FileChunk { data: Vec<u8> },
     FileEnd,
     FileUnavailable { path: String },
     Ping,
     Pong,
+    Unpair,
 }
 
 pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<()> {
@@ -69,7 +93,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     fn entry(n: usize) -> Entry {
-        Entry { path: format!("f{n}.txt"), size: n as u64, mtime_ns: 1, hash: Some([n as u8; 32]) }
+        Entry::simple(format!("f{n}.txt"), n as u64, 1, Some([n as u8; 32]))
     }
 
     #[tokio::test]

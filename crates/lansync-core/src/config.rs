@@ -3,6 +3,15 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteMode {
+    #[default]
+    Never,
+    Ask,
+    MirrorTrash,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub sync_dir: PathBuf,
@@ -10,6 +19,8 @@ pub struct Config {
     pub device_name: String,
     #[serde(default)]
     pub auto_accept_pairing: bool,
+    #[serde(default)]
+    pub delete_mode: DeleteMode,
 }
 
 impl Config {
@@ -19,6 +30,7 @@ impl Config {
             listen_port,
             device_name,
             auto_accept_pairing: false,
+            delete_mode: DeleteMode::Never,
         }
     }
 
@@ -70,12 +82,15 @@ mod tests {
         let cfg = Config::load_or_default(&cfg_path, sync_dir.clone()).unwrap();
         assert_eq!(cfg.listen_port, 42424);
         assert_eq!(cfg.sync_dir, sync_dir);
+        assert_eq!(cfg.delete_mode, DeleteMode::Never);
 
         let mut cfg2 = cfg.clone();
         cfg2.listen_port = 50000;
+        cfg2.delete_mode = DeleteMode::MirrorTrash;
         cfg2.save(&cfg_path).unwrap();
 
         let loaded = Config::load_or_default(&cfg_path, sync_dir).unwrap();
         assert_eq!(loaded.listen_port, 50000);
+        assert_eq!(loaded.delete_mode, DeleteMode::MirrorTrash);
     }
 }

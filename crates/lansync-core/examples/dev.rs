@@ -80,11 +80,12 @@ async fn main() -> Result<()> {
     println!("LanSync started successfully.");
     println!("Local device ID: {}\n", engine.local_device_id());
 
-    let mut events = engine.subscribe_events();
+    let events = engine.subscribe_events();
     let engine_events = engine.clone();
 
     // Event printer task
     tokio::spawn(async move {
+        let mut events = events;
         while let Ok(event) = events.recv().await {
             match event {
                 SyncEvent::PeerDiscovered(peer) => {
@@ -123,6 +124,12 @@ async fn main() -> Result<()> {
                 }
                 SyncEvent::SyncCompleted { peer_id } => {
                     println!("[SYNC DONE] Sync completed with {}\n", peer_id);
+                }
+                SyncEvent::FileTrashed { rel_path, trash_path } => {
+                    println!("[TRASHED] File moved to trash: {} -> {}", rel_path, trash_path);
+                }
+                SyncEvent::PendingDeletion { peer_id, rel_path } => {
+                    println!("[PENDING DELETION] Peer {} deleted file {}. Confirmation needed.", peer_id, rel_path);
                 }
                 SyncEvent::Error(err) => {
                     eprintln!("[ERROR] {}", err);

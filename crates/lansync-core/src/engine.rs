@@ -14,7 +14,7 @@ use crate::discovery::{DiscoveredPeer, DiscoveryService};
 use crate::fsutil::hash_file;
 use crate::identity::{device_id_from_cert, fingerprint, Identity};
 use crate::index::Index;
-use crate::pairing::{pairing_code, Peer, PeerStore};
+use crate::pairing::{pairing_code, PairingLimiter, Peer, PeerStore};
 use crate::paths::to_fs_path;
 use crate::planner::{plan, Action, PlanInput};
 use crate::protocol::{
@@ -22,7 +22,15 @@ use crate::protocol::{
 };
 use crate::transfer::{FinishError, Incoming};
 use crate::transport::{accept, client_config, connect, server_config, SecureConn};
+use crate::version_vector::VersionVector;
 use crate::watcher::FolderWatcher;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingDeletion {
+    pub peer_id: String,
+    pub path: String,
+    pub timestamp: u64,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SyncEvent {
@@ -35,6 +43,8 @@ pub enum SyncEvent {
     SyncStarted { peer_id: String },
     FileDownloading { rel_path: String, size: u64 },
     FileDownloaded { rel_path: String },
+    FileTrashed { rel_path: String, trash_path: String },
+    PendingDeletion { peer_id: String, rel_path: String },
     ConflictCreated { original: String, conflict: String },
     SyncCompleted { peer_id: String },
     Error(String),
@@ -43,18 +53,25 @@ pub enum SyncEvent {
 type PendingPairingMap = HashMap<String, (String, oneshot::Sender<bool>)>;
 
 pub struct SyncEngine {
+    data_dir: PathBuf,
     config: Arc<RwLock<Config>>,
     identity: Arc<Identity>,
     peer_store: Arc<Mutex<PeerStore>>,
     index_db: Arc<Mutex<Index>>,
     events_tx: broadcast::Sender<SyncEvent>,
     pending_pairings: Arc<Mutex<PendingPairingMap>>,
+    pending_deletions: Arc<Mutex<Vec<PendingDeletion>>>,
+    pairing_limiter: Arc<Mutex<PairingLimiter>>,
     connected_peers: Arc<Mutex<HashSet<String>>>,
     active_peer_senders: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
+    peer_cancellations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     shutdown_notify: Arc<Notify>,
     local_addr: SocketAddr,
     _watcher: Arc<Mutex<Option<FolderWatcher>>>,
     discovery: Arc<Mutex<Option<DiscoveryService>>>,
+    discovered_peers: Arc<Mutex<HashMap<String, DiscoveredPeer>>>,
+    is_paused: Arc<std::sync::atomic::AtomicBool>,
+    bandwidth_limit_kbps: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl SyncEngine {
@@ -62,11 +79,20 @@ impl SyncEngine {
         tokio::fs::create_dir_all(&data_dir).await?;
         tokio::fs::create_dir_all(&config.sync_dir).await?;
 
+        // 2.5 Clean shutdown verification: detect unexpected crash or abrupt power off
+        let clean_flag = data_dir.join(".clean_shutdown");
+        let was_clean = clean_flag.exists();
+        if !was_clean {
+            info!("Previous shutdown was ungraceful. Running thorough initial scan.");
+        }
+        let _ = tokio::fs::remove_file(&clean_flag).await;
+
         let identity = Arc::new(Identity::load_or_create(&data_dir)?);
         let peer_store = Arc::new(Mutex::new(PeerStore::load(&data_dir.join("peers.json"))?));
         let index_db = Arc::new(Mutex::new(Index::open(
             &data_dir.join("index.db"),
             &config.sync_dir,
+            &identity.device_id,
         )?));
 
         // Initial scan of the sync directory
@@ -93,18 +119,25 @@ impl SyncEngine {
         let cli_cfg = client_config(&identity)?;
 
         let engine = Arc::new(Self {
+            data_dir: data_dir.clone(),
             config: Arc::new(RwLock::new(config.clone())),
             identity: identity.clone(),
             peer_store: peer_store.clone(),
             index_db: index_db.clone(),
             events_tx: events_tx.clone(),
             pending_pairings: Arc::new(Mutex::new(HashMap::new())),
+            pending_deletions: Arc::new(Mutex::new(Vec::new())),
+            pairing_limiter: Arc::new(Mutex::new(PairingLimiter::default_policy())),
             connected_peers: Arc::new(Mutex::new(HashSet::new())),
             active_peer_senders: Arc::new(Mutex::new(HashMap::new())),
+            peer_cancellations: Arc::new(Mutex::new(HashMap::new())),
             shutdown_notify: shutdown_notify.clone(),
             local_addr,
             _watcher: Arc::new(Mutex::new(None)),
             discovery: Arc::new(Mutex::new(None)),
+            discovered_peers: Arc::new(Mutex::new(HashMap::new())),
+            is_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bandwidth_limit_kbps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
 
         // Start file watcher
@@ -120,6 +153,9 @@ impl SyncEngine {
         let engine_watcher = engine.clone();
         tokio::spawn(async move {
             while watcher_rx.recv().await.is_some() {
+                if engine_watcher.is_paused() {
+                    continue;
+                }
                 debug!("Watcher detected changes, rescanning index...");
                 let changed_entries = {
                     let mut db = engine_watcher.index_db.lock().await;
@@ -152,6 +188,11 @@ impl SyncEngine {
                 let engine_disc = engine.clone();
                 tokio::spawn(async move {
                     while let Ok(discovered) = rx_peer.recv().await {
+                        {
+                            let mut disc_map = engine_disc.discovered_peers.lock().await;
+                            disc_map.insert(discovered.device_id.clone(), discovered.clone());
+                        }
+
                         let _ = engine_disc
                             .events_tx
                             .send(SyncEvent::PeerDiscovered(discovered.clone()));
@@ -255,6 +296,176 @@ impl SyncEngine {
         }
     }
 
+    /// Unpairs a device, removes it from peer store and disconnects active connections.
+    pub async fn unpair_peer(&self, peer_id: &str) -> Result<bool> {
+        let (removed, peer_info) = {
+            let mut store = self.peer_store.lock().await;
+            let info = store.get(peer_id).cloned();
+            let ok = store.remove(peer_id);
+            if ok {
+                let _ = store.save();
+            }
+            (ok, info)
+        };
+        {
+            let mut conns = self.connected_peers.lock().await;
+            conns.remove(peer_id);
+        }
+        if let Some(tx) = {
+            let mut senders = self.active_peer_senders.lock().await;
+            senders.remove(peer_id)
+        } {
+            let _ = tx.send(Message::Unpair).await;
+        }
+        if let Some(cancel_tx) = {
+            let mut cancels = self.peer_cancellations.lock().await;
+            cancels.remove(peer_id)
+        } {
+            let _ = cancel_tx.send(());
+        }
+        let _ = self.events_tx.send(SyncEvent::PeerDisconnected { peer_id: peer_id.to_string() });
+
+        if let Some(p) = peer_info {
+            let mut disc = self.discovered_peers.lock().await;
+            if !disc.contains_key(peer_id) {
+                let addresses = p.last_addr.as_ref().and_then(|a| a.parse().ok()).into_iter().collect();
+                disc.insert(
+                    peer_id.to_string(),
+                    DiscoveredPeer {
+                        device_id: p.device_id.clone(),
+                        device_name: p.name.clone(),
+                        port: self.local_addr.port(),
+                        addresses,
+                    },
+                );
+            }
+        }
+        if let Some(dp) = self.discovered_peers.lock().await.get(peer_id).cloned() {
+            let _ = self.events_tx.send(SyncEvent::PeerDiscovered(dp));
+        }
+
+        Ok(removed)
+    }
+
+    pub async fn list_discovered_peers(&self) -> Vec<DiscoveredPeer> {
+        let disc = self.discovered_peers.lock().await;
+        disc.values().cloned().collect()
+    }
+
+    pub async fn rescan_peers(&self) {
+        let peers = self.list_discovered_peers().await;
+        for peer in peers {
+            let _ = self.events_tx.send(SyncEvent::PeerDiscovered(peer));
+        }
+        if let Some(ref mut disc) = *self.discovery.lock().await {
+            let device_name = self.config.read().await.device_name.clone();
+            let _ = disc.register(&device_name, self.local_addr.port());
+        }
+    }
+
+    pub async fn list_peers(&self) -> Vec<Peer> {
+        let store = self.peer_store.lock().await;
+        store.list().to_vec()
+    }
+
+    pub async fn connected_peer_ids(&self) -> HashSet<String> {
+        self.connected_peers.lock().await.clone()
+    }
+
+    /// Removes tombstone for a file, allowing manual re-sync/restore from peer.
+    pub async fn restore_tombstone(&self, path: &str) -> Result<bool> {
+        let mut db = self.index_db.lock().await;
+        db.remove_tombstone(path)
+    }
+
+    pub async fn list_pending_deletions(&self) -> Vec<PendingDeletion> {
+        self.pending_deletions.lock().await.clone()
+    }
+
+    pub async fn resolve_pending_deletion(&self, path: &str, accept: bool) -> Result<()> {
+        let mut list = self.pending_deletions.lock().await;
+        list.retain(|item| item.path != path);
+
+        if accept {
+            let sync_dir = self.config.read().await.sync_dir.clone();
+            let src = crate::paths::to_fs_path(&sync_dir, path);
+            if src.exists() {
+                let trash_dir = sync_dir.join(".lansync-trash");
+                let _ = tokio::fs::create_dir_all(&trash_dir).await;
+                let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+                let fname = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                let trash_dst = trash_dir.join(format!("{ts}_{fname}"));
+                let _ = tokio::fs::rename(&src, &trash_dst).await;
+            }
+
+            let mut db = self.index_db.lock().await;
+            let del_entry = Entry {
+                path: path.to_string(),
+                size: 0,
+                mtime_ns: 0,
+                hash: None,
+                vv: VersionVector::default(),
+            };
+            let _ = db.record_file(&del_entry);
+        }
+        Ok(())
+    }
+
+    pub async fn get_delete_mode(&self) -> crate::config::DeleteMode {
+        self.config.read().await.delete_mode
+    }
+
+    pub async fn set_delete_mode(&self, mode: crate::config::DeleteMode) -> Result<()> {
+        let mut cfg = self.config.write().await;
+        cfg.delete_mode = mode;
+        cfg.save(&self.data_dir.join("config.json"))?;
+        Ok(())
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.is_paused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub async fn set_paused(&self, paused: bool) {
+        self.is_paused.store(paused, std::sync::atomic::Ordering::Relaxed);
+        if !paused {
+            self.trigger_sync_all().await;
+        }
+    }
+
+    pub fn get_bandwidth_limit_kbps(&self) -> u32 {
+        self.bandwidth_limit_kbps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_bandwidth_limit_kbps(&self, kbps: u32) {
+        self.bandwidth_limit_kbps.store(kbps, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub async fn trigger_sync_all(&self) {
+        let local_entries = {
+            let mut db = self.index_db.lock().await;
+            let _ = db.scan();
+            db.entries().unwrap_or_default()
+        };
+        let senders: Vec<mpsc::Sender<Message>> = {
+            let map = self.active_peer_senders.lock().await;
+            map.values().cloned().collect()
+        };
+        for tx in senders {
+            for msg in index_messages(local_entries.clone(), false) {
+                let _ = tx.send(msg).await;
+            }
+        }
+    }
+
+    pub async fn set_peer_delete_mode(&self, peer_id: &str, mode: Option<crate::config::DeleteMode>) -> Result<()> {
+        let mut pstore = self.peer_store.lock().await;
+        if pstore.set_delete_mode(peer_id, mode) {
+            pstore.save()?;
+        }
+        Ok(())
+    }
+
     pub async fn pair_with(self: &Arc<Self>, addr: SocketAddr) -> Result<()> {
         let cli_cfg = client_config(&self.identity)?;
         let conn = connect(addr, cli_cfg).await?;
@@ -332,6 +543,16 @@ impl SyncEngine {
         let pairing_mode = !is_paired || remote_hello.2;
 
         if pairing_mode {
+            let peer_ip = conn.peer_addr.ip().to_string();
+            {
+                let limiter = self.pairing_limiter.lock().await;
+                if let Err(err) = limiter.can_attempt(&peer_ip, std::time::Instant::now()) {
+                    warn!("Pairing attempt rejected for peer {}: {}", peer_ip, err);
+                    let _ = tx_msg.send(Message::PairDecision { accept: false }).await;
+                    return;
+                }
+            }
+
             let code = pairing_code(&self.identity.cert_der, &peer_cert);
             info!(
                 "Pairing requested with peer {} ({}) - Confirmation Code: [{}]",
@@ -353,8 +574,8 @@ impl SyncEngine {
                     code: code.clone(),
                 });
 
-                // Await decision or 60-second timeout
-                match tokio::time::timeout(Duration::from_secs(60), decision_rx).await {
+                // Await decision or 90-second timeout (code TTL)
+                match tokio::time::timeout(Duration::from_secs(90), decision_rx).await {
                     Ok(Ok(decision)) => decision,
                     _ => false,
                 }
@@ -375,7 +596,15 @@ impl SyncEngine {
 
             if !accepted || !peer_decision {
                 info!("Pairing failed or rejected with peer {}", peer_id);
+                let mut limiter = self.pairing_limiter.lock().await;
+                limiter.record_failure(&peer_ip, std::time::Instant::now());
                 return;
+            }
+
+            // Success: clear failures from limiter
+            {
+                let mut limiter = self.pairing_limiter.lock().await;
+                limiter.record_success(&peer_ip);
             }
 
             // Save peer in PeerStore
@@ -386,6 +615,7 @@ impl SyncEngine {
                     name: remote_name.clone(),
                     cert_fingerprint: peer_fp.clone(),
                     last_addr: Some(conn.peer_addr.to_string()),
+                    delete_mode: None,
                 });
                 let _ = store.save();
             }
@@ -407,6 +637,11 @@ impl SyncEngine {
         {
             let mut senders = self.active_peer_senders.lock().await;
             senders.insert(peer_id.clone(), tx_msg.clone());
+        }
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        {
+            let mut cancels = self.peer_cancellations.lock().await;
+            cancels.insert(peer_id.clone(), cancel_tx);
         }
 
         let _ = self.events_tx.send(SyncEvent::PeerConnected {
@@ -433,12 +668,50 @@ impl SyncEngine {
 
         // Loop to read incoming messages from peer
         loop {
-            let msg = match read_msg(&mut r).await {
-                Ok(m) => m,
-                Err(_) => break,
+            let msg = tokio::select! {
+                biased;
+                _ = &mut cancel_rx => {
+                    info!("Connection cancelled locally for peer {}", peer_id);
+                    break;
+                }
+                res = read_msg(&mut r) => {
+                    match res {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    }
+                }
             };
 
             match msg {
+                Message::Unpair => {
+                    info!("Remote peer {} requested unpair. Removing peer and disconnecting.", peer_id);
+                    let removed_peer = {
+                        let mut store = self.peer_store.lock().await;
+                        let p = store.get(&peer_id).cloned();
+                        store.remove(&peer_id);
+                        let _ = store.save();
+                        p
+                    };
+                    if let Some(p) = removed_peer {
+                        let mut disc = self.discovered_peers.lock().await;
+                        if !disc.contains_key(&peer_id) {
+                            let addresses = p.last_addr.as_ref().and_then(|a| a.parse().ok()).into_iter().collect();
+                            disc.insert(
+                                peer_id.clone(),
+                                DiscoveredPeer {
+                                    device_id: p.device_id.clone(),
+                                    device_name: p.name.clone(),
+                                    port: self.local_addr.port(),
+                                    addresses,
+                                },
+                            );
+                        }
+                    }
+                    if let Some(dp) = self.discovered_peers.lock().await.get(&peer_id).cloned() {
+                        let _ = self.events_tx.send(SyncEvent::PeerDiscovered(dp));
+                    }
+                    break;
+                }
                 Message::Index { entries } => {
                     remote_entries.clear();
                     for e in entries {
@@ -467,41 +740,17 @@ impl SyncEngine {
                 Message::GetFile { path, hash } => {
                     let sync_dir = self.config.read().await.sync_dir.clone();
                     let tx_chunk = tx_msg.clone();
+                    let limit_kbps = self.get_bandwidth_limit_kbps();
                     tokio::spawn(async move {
-                        let full = to_fs_path(&sync_dir, &path);
-                        if let Ok(meta) = tokio::fs::metadata(&full).await {
-                            let mtime = crate::fsutil::mtime_ns(&meta);
-                            let size = meta.len();
-                            let _ = tx_chunk
-                                .send(Message::FileHeader {
-                                    path: path.clone(),
-                                    size,
-                                    hash,
-                                    mtime_ns: mtime,
-                                })
-                                .await;
-
-                            if let Ok(mut f) = tokio::fs::File::open(&full).await {
-                                use tokio::io::AsyncReadExt;
-                                let mut buf = vec![0u8; CHUNK_SIZE];
-                                loop {
-                                    match f.read(&mut buf).await {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            let _ = tx_chunk
-                                                .send(Message::FileChunk {
-                                                    data: buf[..n].to_vec(),
-                                                })
-                                                .await;
-                                        }
-                                        Err(_) => break,
-                                    }
-                                }
-                            }
-                            let _ = tx_chunk.send(Message::FileEnd).await;
-                        } else {
-                            let _ = tx_chunk.send(Message::FileUnavailable { path }).await;
-                        }
+                        send_file_to_peer(sync_dir, path, hash, 0, tx_chunk, limit_kbps).await;
+                    });
+                }
+                Message::GetFileRange { path, hash, offset } => {
+                    let sync_dir = self.config.read().await.sync_dir.clone();
+                    let tx_chunk = tx_msg.clone();
+                    let limit_kbps = self.get_bandwidth_limit_kbps();
+                    tokio::spawn(async move {
+                        send_file_to_peer(sync_dir, path, hash, offset, tx_chunk, limit_kbps).await;
                     });
                 }
                 Message::FileHeader { path, size, hash, mtime_ns } => {
@@ -513,6 +762,15 @@ impl SyncEngine {
                     current_incoming_path = Some(path.clone());
                     current_incoming = Some(Incoming::begin(&sync_dir, &path, size, hash, mtime_ns).await);
                 }
+                Message::FileHeaderRange { path, size, hash, mtime_ns, offset } => {
+                    let sync_dir = self.config.read().await.sync_dir.clone();
+                    let _ = self.events_tx.send(SyncEvent::FileDownloading {
+                        rel_path: path.clone(),
+                        size,
+                    });
+                    current_incoming_path = Some(path.clone());
+                    current_incoming = Some(Incoming::begin_resumable(&sync_dir, &path, size, hash, mtime_ns, offset).await);
+                }
                 Message::FileChunk { data } => {
                     if let Some(ref mut inc) = current_incoming {
                         inc.chunk(&data).await;
@@ -522,7 +780,10 @@ impl SyncEngine {
                     if let (Some(inc), Some(rel)) = (current_incoming.take(), current_incoming_path.take()) {
                         let exp = expected_expected_local.remove(&rel).flatten();
                         match inc.finish(exp).await {
-                            Ok(entry) => {
+                            Ok(mut entry) => {
+                                if let Some(re) = remote_entries.get(&rel) {
+                                    entry.vv = re.vv.clone();
+                                }
                                 let mut db = self.index_db.lock().await;
                                 let _ = db.record_file(&entry);
                                 if let Some(h) = entry.hash {
@@ -564,6 +825,10 @@ impl SyncEngine {
             let mut senders = self.active_peer_senders.lock().await;
             senders.remove(&peer_id);
         }
+        {
+            let mut cancels = self.peer_cancellations.lock().await;
+            cancels.remove(&peer_id);
+        }
         let _ = self.events_tx.send(SyncEvent::PeerDisconnected {
             peer_id: peer_id.clone(),
         });
@@ -578,13 +843,17 @@ impl SyncEngine {
         tx_msg: &mpsc::Sender<Message>,
         expected_local_map: &mut HashMap<String, Option<Hash>>,
     ) {
-        let local_entries = {
+        if self.is_paused() {
+            return;
+        }
+
+        let (local_entries, bases, tombstones) = {
             let db = self.index_db.lock().await;
-            db.entries().unwrap_or_default()
-        };
-        let bases = {
-            let db = self.index_db.lock().await;
-            db.bases(peer_id).unwrap_or_default()
+            (
+                db.entries().unwrap_or_default(),
+                db.bases(peer_id).unwrap_or_default(),
+                db.tombstones().unwrap_or_default(),
+            )
         };
 
         let my_id = self.identity.device_id.clone();
@@ -593,13 +862,24 @@ impl SyncEngine {
         let stamp = Local::now().format("%Y-%m-%d %H%M").to_string();
 
         let remote_vec: Vec<Entry> = remote_entries.values().cloned().collect();
+        let delete_mode = {
+            let pstore = self.peer_store.lock().await;
+            pstore
+                .list()
+                .iter()
+                .find(|p| p.device_id == peer_id)
+                .and_then(|p| p.delete_mode)
+                .unwrap_or(self.config.read().await.delete_mode)
+        };
         let actions = plan(&PlanInput {
             local: &local_entries,
             remote: &remote_vec,
             base: &bases,
+            tombstones: &tombstones,
             i_win_conflicts: i_win,
             my_name: &my_name,
             stamp: &stamp,
+            delete_mode,
         });
 
         let sync_dir = self.config.read().await.sync_dir.clone();
@@ -608,12 +888,25 @@ impl SyncEngine {
             match action {
                 Action::Download { local_path, remote_path, hash, expected_local } => {
                     expected_local_map.insert(local_path.clone(), expected_local);
-                    let _ = tx_msg
-                        .send(Message::GetFile {
-                            path: remote_path,
-                            hash,
-                        })
-                        .await;
+                    let expected_size = remote_entries.get(&remote_path).map(|e| e.size).unwrap_or(0);
+                    let resume_offset = crate::transfer::check_resume_offset(&sync_dir, &local_path, &hash, expected_size).await;
+                    if resume_offset > 0 {
+                        tracing::info!("Resuming download for {} at offset {}", local_path, resume_offset);
+                        let _ = tx_msg
+                            .send(Message::GetFileRange {
+                                path: remote_path,
+                                hash,
+                                offset: resume_offset,
+                            })
+                            .await;
+                    } else {
+                        let _ = tx_msg
+                            .send(Message::GetFile {
+                                path: remote_path,
+                                hash,
+                            })
+                            .await;
+                    }
                 }
                 Action::UpdateBase { path, hash } => {
                     let mut db = self.index_db.lock().await;
@@ -625,17 +918,16 @@ impl SyncEngine {
                     let dst = to_fs_path(&sync_dir, &conflict_path);
                     if let Ok(()) = tokio::fs::rename(&src, &dst).await {
                         // Update index for the freshly created conflict file
-                        if let Ok(meta) = tokio::fs::metadata(&dst).await {
-                            if let Ok(h) = hash_file(&dst) {
-                                let entry = Entry {
-                                    path: conflict_path.clone(),
-                                    size: meta.len(),
-                                    mtime_ns: crate::fsutil::mtime_ns(&meta),
-                                    hash: Some(h),
-                                };
-                                let mut db = self.index_db.lock().await;
-                                let _ = db.record_file(&entry);
-                            }
+                        if let (Ok(meta), Ok(h)) = (tokio::fs::metadata(&dst).await, hash_file(&dst)) {
+                            let entry = Entry {
+                                path: conflict_path.clone(),
+                                size: meta.len(),
+                                mtime_ns: crate::fsutil::mtime_ns(&meta),
+                                hash: Some(h),
+                                vv: VersionVector::default(),
+                            };
+                            let mut db = self.index_db.lock().await;
+                            let _ = db.record_file(&entry);
                         }
                         let _ = self.events_tx.send(SyncEvent::ConflictCreated {
                             original: local_path.clone(),
@@ -652,6 +944,95 @@ impl SyncEngine {
                         })
                         .await;
                 }
+                Action::Rename { from_path, to_path, hash } => {
+                    let src = to_fs_path(&sync_dir, &from_path);
+                    let dst = to_fs_path(&sync_dir, &to_path);
+                    if let Some(parent) = dst.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
+                    }
+                    if let Ok(()) = tokio::fs::rename(&src, &dst).await {
+                        tracing::info!("Renamed local file {} -> {} (zero network transfer)", from_path, to_path);
+                        if let Ok(meta) = tokio::fs::metadata(&dst).await {
+                            let mut db = self.index_db.lock().await;
+                            let old_entry = Entry {
+                                path: from_path.clone(),
+                                size: 0,
+                                mtime_ns: 0,
+                                hash: None,
+                                vv: VersionVector::default(),
+                            };
+                            let _ = db.record_file(&old_entry);
+                            let new_entry = Entry {
+                                path: to_path.clone(),
+                                size: meta.len(),
+                                mtime_ns: crate::fsutil::mtime_ns(&meta),
+                                hash: Some(hash),
+                                vv: match remote_entries.get(&to_path) {
+                                    Some(re) => re.vv.clone(),
+                                    None => VersionVector::default(),
+                                },
+                            };
+                            let _ = db.record_file(&new_entry);
+                            let _ = db.set_base(peer_id, &to_path, &hash);
+                        }
+                    } else {
+                        // Fallback to normal download if rename fails
+                        expected_local_map.insert(to_path.clone(), None);
+                        let _ = tx_msg
+                            .send(Message::GetFile {
+                                path: to_path,
+                                hash,
+                            })
+                            .await;
+                    }
+                }
+                Action::Trash { path } => {
+                    let src = to_fs_path(&sync_dir, &path);
+                    if src.exists() {
+                        let trash_dir = sync_dir.join(".lansync-trash");
+                        let _ = tokio::fs::create_dir_all(&trash_dir).await;
+                        let ts = Local::now().format("%Y%m%d_%H%M%S").to_string();
+                        let fname = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                        let trash_dst = trash_dir.join(format!("{ts}_{fname}"));
+                        if let Ok(()) = tokio::fs::rename(&src, &trash_dst).await {
+                            tracing::info!("Moved file to trash: {} -> {:?}", path, trash_dst);
+                            let _ = self.events_tx.send(SyncEvent::FileTrashed {
+                                rel_path: path.clone(),
+                                trash_path: trash_dst.to_string_lossy().to_string(),
+                            });
+                        }
+                    }
+                    let mut db = self.index_db.lock().await;
+                    let del_entry = Entry {
+                        path: path.clone(),
+                        size: 0,
+                        mtime_ns: 0,
+                        hash: None,
+                        vv: match remote_entries.get(&path) {
+                            Some(re) => re.vv.clone(),
+                            None => VersionVector::default(),
+                        },
+                    };
+                    let _ = db.record_file(&del_entry);
+                }
+                Action::AskDelete { path } => {
+                    let mut pending = self.pending_deletions.lock().await;
+                    if !pending.iter().any(|item| item.path == path) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        pending.push(PendingDeletion {
+                            peer_id: peer_id.to_string(),
+                            path: path.clone(),
+                            timestamp: now,
+                        });
+                        let _ = self.events_tx.send(SyncEvent::PendingDeletion {
+                            peer_id: peer_id.to_string(),
+                            rel_path: path,
+                        });
+                    }
+                }
             }
         }
 
@@ -665,7 +1046,72 @@ impl SyncEngine {
         if let Some(disc) = self.discovery.lock().await.take() {
             let _ = disc.shutdown();
         }
+        let _ = tokio::fs::write(&self.data_dir.join(".clean_shutdown"), b"clean\n").await;
         Ok(())
+    }
+}
+
+async fn send_file_to_peer(
+    sync_dir: PathBuf,
+    path: String,
+    hash: Hash,
+    offset: u64,
+    tx_chunk: mpsc::Sender<Message>,
+    limit_kbps: u32,
+) {
+    let full = to_fs_path(&sync_dir, &path);
+    if let Ok(meta) = tokio::fs::metadata(&full).await {
+        let mtime = crate::fsutil::mtime_ns(&meta);
+        let size = meta.len();
+        if offset > 0 {
+            let _ = tx_chunk
+                .send(Message::FileHeaderRange {
+                    path: path.clone(),
+                    size,
+                    hash,
+                    mtime_ns: mtime,
+                    offset,
+                })
+                .await;
+        } else {
+            let _ = tx_chunk
+                .send(Message::FileHeader {
+                    path: path.clone(),
+                    size,
+                    hash,
+                    mtime_ns: mtime,
+                })
+                .await;
+        }
+
+        if let Ok(std_file) = crate::fsutil::open_with_retry(&full, Duration::from_secs(5)).await {
+            let mut f = tokio::fs::File::from_std(std_file);
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            if offset > 0 {
+                let _ = f.seek(std::io::SeekFrom::Start(offset)).await;
+            }
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            loop {
+                match f.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = tx_chunk
+                            .send(Message::FileChunk {
+                                data: buf[..n].to_vec(),
+                            })
+                            .await;
+                        if limit_kbps > 0 {
+                            let delay_micros = (n as u64 * 1_000_000) / (limit_kbps as u64 * 1024);
+                            tokio::time::sleep(Duration::from_micros(delay_micros)).await;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = tx_chunk.send(Message::FileEnd).await;
+    } else {
+        let _ = tx_chunk.send(Message::FileUnavailable { path }).await;
     }
 }
 
@@ -680,8 +1126,30 @@ mod tests {
         let sync_dir = dir.path().join("sync");
         let data_dir = dir.path().join("data");
         let cfg = Config::new(sync_dir, 0, "TestDev".into());
-        let engine = SyncEngine::start(cfg, data_dir).await.unwrap();
+        let engine = SyncEngine::start(cfg, data_dir.clone()).await.unwrap();
         assert!(!engine.local_device_id().is_empty());
+        engine.shutdown().await.unwrap();
+        assert!(data_dir.join(".clean_shutdown").exists(), "Clean shutdown flag must be saved upon exit");
+    }
+
+    #[tokio::test]
+    async fn test_engine_pause_and_bandwidth_limit() {
+        let dir = tempdir().unwrap();
+        let sync_dir = dir.path().join("sync");
+        let data_dir = dir.path().join("data");
+        let cfg = Config::new(sync_dir, 0, "TestDev".into());
+        let engine = SyncEngine::start(cfg, data_dir).await.unwrap();
+
+        assert!(!engine.is_paused());
+        engine.set_paused(true).await;
+        assert!(engine.is_paused());
+        engine.set_paused(false).await;
+        assert!(!engine.is_paused());
+
+        assert_eq!(engine.get_bandwidth_limit_kbps(), 0);
+        engine.set_bandwidth_limit_kbps(2048);
+        assert_eq!(engine.get_bandwidth_limit_kbps(), 2048);
+
         engine.shutdown().await.unwrap();
     }
 }
