@@ -310,19 +310,27 @@ function handleSyncEvent(event) {
     refreshStatus();
   } else if (event.PeerConnected) {
     const { peer_id, device_name } = event.PeerConnected;
-    const existing = knownPeers.get(peer_id) || { device_id, device_name, addresses: [] };
+    const existing = knownPeers.get(peer_id) || { device_id: peer_id, device_name, addresses: [] };
     existing.connected = true;
     knownPeers.set(peer_id, existing);
+    if (pairedPeersMap.has(peer_id)) {
+      pairedPeersMap.get(peer_id).is_connected = true;
+    }
     renderPeers();
     setSyncState('idle');
+    refreshPeers();
   } else if (event.PeerDisconnected) {
     const { peer_id } = event.PeerDisconnected;
     const existing = knownPeers.get(peer_id);
     if (existing) {
       existing.connected = false;
-      renderPeers();
     }
+    if (pairedPeersMap.has(peer_id)) {
+      pairedPeersMap.get(peer_id).is_connected = false;
+    }
+    renderPeers();
     setSyncState('idle');
+    refreshPeers();
   } else if (event.FileDownloading) {
     const { rel_path, size } = event.FileDownloading;
     setSyncState('syncing');

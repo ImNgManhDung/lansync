@@ -256,6 +256,40 @@ impl SyncEngine {
             }
         });
 
+        // Background auto-reconnect task for paired peers that are disconnected
+        let engine_reconnect = engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = engine_reconnect.shutdown_notify.notified() => {
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let paired_peers = engine_reconnect.peer_store.lock().await.list().to_vec();
+                        let connected = engine_reconnect.connected_peers.lock().await.clone();
+                        for peer in paired_peers {
+                            if !connected.contains(&peer.device_id) {
+                                let addr_opt = peer.last_addr.as_ref().and_then(|a| a.parse().ok())
+                                    .or_else(|| {
+                                        let disc = engine_reconnect.discovered_peers.try_lock().ok()?;
+                                        disc.get(&peer.device_id).and_then(|d| d.addresses.first().copied())
+                                    });
+                                let Some(addr) = addr_opt else { continue };
+                                let Ok(cli_cfg) = client_config(&engine_reconnect.identity) else { continue };
+                                if let Ok(conn) = connect(addr, cli_cfg).await {
+                                    let eng = engine_reconnect.clone();
+                                    tokio::spawn(async move {
+                                        eng.handle_connection(conn, false).await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Loop to accept incoming TCP connections
         let engine_srv = engine.clone();
         tokio::spawn(async move {
@@ -433,6 +467,20 @@ impl SyncEngine {
                 }
                 let target_ip = std::net::Ipv4Addr::new(a, b, c, host);
                 let target_addr = SocketAddr::new(std::net::IpAddr::V4(target_ip), target_port);
+
+                // Skip probing if a peer with this IP is already connected
+                let is_already_connected = {
+                    let disc = self.discovered_peers.lock().await;
+                    let conns = self.connected_peers.lock().await;
+                    disc.values().any(|p| {
+                        p.addresses.iter().any(|addr| addr.ip() == std::net::IpAddr::V4(target_ip))
+                            && conns.contains(&p.device_id)
+                    })
+                };
+                if is_already_connected {
+                    continue;
+                }
+
                 let cli_cfg_clone = cli_cfg.clone();
                 let engine = self.clone();
 
@@ -792,24 +840,30 @@ impl SyncEngine {
                 .send(SyncEvent::PairingAccepted { peer_id: peer_id.clone() });
         }
 
+        // Update last_addr in PeerStore
+        {
+            let mut store = self.peer_store.lock().await;
+            store.set_addr(&peer_id, &conn.peer_addr.to_string());
+            let _ = store.save();
+        }
+
         info!("Peer {} fully authenticated and connected.", peer_id);
 
-        // Successfully paired and authenticated
+        // Register connection and cancel previous one if any
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        {
+            let mut cancels = self.peer_cancellations.lock().await;
+            if let Some(old_cancel) = cancels.insert(peer_id.clone(), cancel_tx) {
+                let _ = old_cancel.send(());
+            }
+        }
         {
             let mut conns = self.connected_peers.lock().await;
-            if !conns.insert(peer_id.clone()) {
-                // Connection already established with this peer
-                return;
-            }
+            conns.insert(peer_id.clone());
         }
         {
             let mut senders = self.active_peer_senders.lock().await;
             senders.insert(peer_id.clone(), tx_msg.clone());
-        }
-        let (cancel_tx, mut cancel_rx) = oneshot::channel();
-        {
-            let mut cancels = self.peer_cancellations.lock().await;
-            cancels.insert(peer_id.clone(), cancel_tx);
         }
 
         let _ = self.events_tx.send(SyncEvent::PeerConnected {
@@ -820,9 +874,10 @@ impl SyncEngine {
             .events_tx
             .send(SyncEvent::SyncStarted { peer_id: peer_id.clone() });
 
-        // Send local index to remote peer
+        // Send local index to remote peer (fresh disk scan ensures any new files are synced immediately)
         let local_entries = {
-            let db = self.index_db.lock().await;
+            let mut db = self.index_db.lock().await;
+            let _ = db.scan();
             db.entries().unwrap_or_default()
         };
         for msg in index_messages(local_entries, true) {
@@ -834,6 +889,9 @@ impl SyncEngine {
         let mut current_incoming: Option<Incoming> = None;
         let mut current_incoming_path: Option<String> = None;
 
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
+        ping_interval.tick().await;
+
         // Loop to read incoming messages from peer
         loop {
             let msg = tokio::select! {
@@ -842,10 +900,20 @@ impl SyncEngine {
                     info!("Connection cancelled locally for peer {}", peer_id);
                     break;
                 }
+                _ = ping_interval.tick() => {
+                    if let Err(e) = tx_msg.send(Message::Ping).await {
+                        debug!("Peer {} ping send error: {:?}", peer_id, e);
+                        break;
+                    }
+                    continue;
+                }
                 res = read_msg(&mut r) => {
                     match res {
                         Ok(m) => m,
-                        Err(_) => break,
+                        Err(e) => {
+                            debug!("Peer {} read error or disconnected: {:?}", peer_id, e);
+                            break;
+                        }
                     }
                 }
             };
@@ -984,22 +1052,20 @@ impl SyncEngine {
             }
         }
 
-        // Cleanup upon disconnection
-        {
-            let mut conns = self.connected_peers.lock().await;
-            conns.remove(&peer_id);
-        }
+        // Cleanup upon disconnection only if this connection's sender is still active
         {
             let mut senders = self.active_peer_senders.lock().await;
-            senders.remove(&peer_id);
+            if senders.get(&peer_id).is_some_and(|s| s.same_channel(&tx_msg)) {
+                senders.remove(&peer_id);
+                let mut conns = self.connected_peers.lock().await;
+                conns.remove(&peer_id);
+                let mut cancels = self.peer_cancellations.lock().await;
+                cancels.remove(&peer_id);
+                let _ = self.events_tx.send(SyncEvent::PeerDisconnected {
+                    peer_id: peer_id.clone(),
+                });
+            }
         }
-        {
-            let mut cancels = self.peer_cancellations.lock().await;
-            cancels.remove(&peer_id);
-        }
-        let _ = self.events_tx.send(SyncEvent::PeerDisconnected {
-            peer_id: peer_id.clone(),
-        });
         drop(tx_msg);
         let _ = writer_task.await;
     }
