@@ -1,27 +1,63 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod commands;
-mod state;
-mod tray;
+mod application;
+mod domain;
+mod infrastructure;
+mod presentation;
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 use lansync_core::config::Config;
-use lansync_core::engine::{SyncEngine, SyncEvent};
-use state::{ActivityItem, AppState, PendingPairingInfo};
+use lansync_core::engine::SyncEngine;
 
-fn main() {
+use crate::application::state::AppStore;
+use crate::application::use_cases::AppUseCaseInteractor;
+use crate::infrastructure::core_adapter::LanSyncCoreAdapter;
+use crate::infrastructure::os_adapter::OsSystemAdapter;
+use crate::infrastructure::tray_adapter::SystemTrayAdapter;
+use crate::presentation::LanSyncGuiApp;
+
+fn load_window_icon() -> Option<Arc<egui::IconData>> {
+    let png_bytes = include_bytes!("../icons/128x128.png");
+    let mut img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    let w = width as f32;
+    let h = height as f32;
+    let radius = w.min(h) * 0.225;
+
+    for y in 0..height {
+        for x in 0..width {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let qx = (px - w * 0.5).abs() - (w * 0.5 - radius);
+            let qy = (py - h * 0.5).abs() - (h * 0.5 - radius);
+            let dist = qx.max(0.0).hypot(qy.max(0.0)) + qx.min(qy).min(0.0) - radius;
+            let coverage = (0.5 - dist).clamp(0.0, 1.0);
+            let pixel = img.get_pixel_mut(x, y);
+            pixel[3] = ((pixel[3] as f32) * coverage).round() as u8;
+        }
+    }
+
+    Some(Arc::new(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }))
+}
+
+fn main() -> eframe::Result<()> {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     let runtime = tokio::runtime::Runtime::new().expect("Failed to initialize tokio runtime");
+    let _rt_guard = runtime.enter();
 
     // Determine data directory and config path
     let data_dir = Config::default_data_dir();
@@ -35,182 +71,95 @@ fn main() {
 
     let sync_dir = config.sync_dir.clone();
     let device_name = config.device_name.clone();
-    let listen_port = config.listen_port;
 
-    // Start SyncEngine
+    // Start Core SyncEngine (fallback to an OS-assigned free port if 42424 is already in use)
     let engine = runtime
-        .block_on(async { SyncEngine::start(config, data_dir.clone()).await })
+        .block_on(async {
+            match SyncEngine::start(config.clone(), data_dir.clone()).await {
+                Ok(eng) => Ok(eng),
+                Err(e) => {
+                    warn!("Port {} busy ({}), falling back to dynamic port...", config.listen_port, e);
+                    let mut fallback_cfg = config;
+                    fallback_cfg.listen_port = 0;
+                    SyncEngine::start(fallback_cfg, data_dir.clone()).await
+                }
+            }
+        })
         .expect("Failed to start LanSync Core Engine");
 
-    let app_state = Arc::new(AppState {
-        engine: engine.clone(),
-        data_dir,
-        config_path,
-        sync_dir,
+    let listen_port = engine.local_addr().port();
+
+    // Clean Architecture Composition Root:
+    // 1. Infrastructure Adapters
+    let backend_adapter = Arc::new(LanSyncCoreAdapter::new(
+        engine.clone(),
+        sync_dir.clone(),
         device_name,
         listen_port,
-        activities: Arc::new(Mutex::new(Vec::new())),
-        pending_pairing: Arc::new(Mutex::new(None)),
-    });
+    ));
+    let os_adapter = Arc::new(OsSystemAdapter::new());
 
-    let app_state_for_events = app_state.clone();
-    let mut rx_events = engine.subscribe_events();
+    // 2. Application Store & UseCase Interactor
+    let store = AppStore::default();
+    let repaint_signal = Arc::new(AtomicBool::new(false));
+    let show_window_flag = Arc::new(AtomicBool::new(false));
+    let quit_flag = Arc::new(AtomicBool::new(false));
 
-    tauri::Builder::default()
-        .manage(app_state.clone())
-        .setup(move |app| {
-            let app_handle = app.handle().clone();
+    let interactor = AppUseCaseInteractor::new(
+        backend_adapter,
+        os_adapter,
+        store.clone(),
+        show_window_flag.clone(),
+    );
 
-            // Initialize System Tray
-            tray::setup_tray(&app_handle, app_state.clone())?;
+    let (tx_cmd, rx_cmd) = mpsc::unbounded_channel();
+    interactor.spawn_worker(rx_cmd, repaint_signal.clone());
 
-            // When user clicks the window close button (X), hide to tray instead of quitting
-            if let Some(window) = app.get_webview_window("main") {
-                let win_clone = window.clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = win_clone.hide();
-                    }
-                });
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+    // 3. Native System Tray Adapter
+    let tray_adapter = match SystemTrayAdapter::new(
+        sync_dir,
+        show_window_flag.clone(),
+        quit_flag.clone(),
+    ) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            warn!("Could not initialize System Tray icon: {}", e);
+            None
+        }
+    };
 
-            // Event forwarding task: engine -> webview frontend
-            let app_handle_events = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                while let Ok(event) = rx_events.recv().await {
-                    match &event {
-                        SyncEvent::PairingRequested { peer_id, device_name, code } => {
-                            *app_state_for_events.pending_pairing.lock().await = Some(PendingPairingInfo {
-                                peer_id: peer_id.clone(),
-                                device_name: device_name.clone(),
-                                code: code.clone(),
-                            });
-                            // Automatically show and focus the window when a pairing request arrives!
-                            if let Some(w) = app_handle_events.get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.unminimize();
-                                let _ = w.set_focus();
-                            }
-                        }
-                        SyncEvent::PairingAccepted { .. } | SyncEvent::PairingRejected { .. } => {
-                            *app_state_for_events.pending_pairing.lock().await = None;
-                        }
-                        _ => {}
-                    }
+    // 4. Presentation Layer (egui / eframe Desktop Window)
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("LanSync - Đồng bộ Mạng LAN")
+        .with_inner_size([980.0, 640.0])
+        .with_min_inner_size([820.0, 520.0]);
 
-                    let activity_opt = match &event {
-                        SyncEvent::PeerDiscovered(p) => Some(ActivityItem::new(
-                            "Device Discovered",
-                            format!("{} ({})", p.device_name, p.device_id),
-                            "peer",
-                        )),
-                        SyncEvent::PairingRequested { device_name, code, .. } => Some(ActivityItem::new(
-                            "Pairing Requested",
-                            format!("Device: {}, Code: {}", device_name, code),
-                            "peer",
-                        )),
-                        SyncEvent::PairingAccepted { peer_id } => Some(ActivityItem::new(
-                            "Pairing Succeeded",
-                            format!("ID: {}", peer_id),
-                            "peer",
-                        )),
-                        SyncEvent::PeerConnected { device_name, .. } => Some(ActivityItem::new(
-                            "Connected",
-                            device_name.clone(),
-                            "peer",
-                        )),
-                        SyncEvent::PeerDisconnected { peer_id } => Some(ActivityItem::new(
-                            "Disconnected",
-                            format!("ID: {}", peer_id),
-                            "peer",
-                        )),
-                        SyncEvent::FileDownloading { rel_path, size } => Some(ActivityItem::new(
-                            "Downloading File",
-                            format!("{} ({} B)", rel_path, size),
-                            "file",
-                        )),
-                        SyncEvent::FileDownloaded { rel_path } => Some(ActivityItem::new(
-                            "Download Complete",
-                            rel_path.clone(),
-                            "file",
-                        )),
-                        SyncEvent::ConflictCreated { original, conflict } => Some(ActivityItem::new(
-                            "File Conflict",
-                            format!("Original: {} -> Copy: {}", original, conflict),
-                            "conflict",
-                        )),
-                        SyncEvent::SyncCompleted { .. } => Some(ActivityItem::new(
-                            "Sync Completed",
-                            "Data is up to date",
-                            "sync",
-                        )),
-                        SyncEvent::FileTrashed { rel_path, .. } => Some(ActivityItem::new(
-                            "Moved to Trash",
-                            rel_path.clone(),
-                            "file",
-                        )),
-                        SyncEvent::PendingDeletion { peer_id, rel_path } => Some(ActivityItem::new(
-                            "Pending Deletion",
-                            format!("Peer {} requested deletion of {}", peer_id, rel_path),
-                            "file",
-                        )),
-                        SyncEvent::PeerStatusChanged { peer_id, status } => {
-                            let _ = app_handle_events.emit(
-                                "peer_status",
-                                serde_json::json!({ "peer_id": peer_id, "status": status.to_string() }),
-                            );
-                            None
-                        }
-                        SyncEvent::Error(err) => Some(ActivityItem::new(
-                            "System Error",
-                            err.clone(),
-                            "error",
-                        )),
-                        _ => None,
-                    };
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
 
-                    if let Some(item) = activity_opt {
-                        app_state_for_events.add_activity(item).await;
-                    }
+    let native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
 
-                    // Forward event to UI
-                    let _ = app_handle_events.emit("sync_event", serde_json::to_value(&event).unwrap_or_default());
-                }
-            });
+    info!("Starting LanSync Native GUI (egui/eframe)...");
+    let res = eframe::run_native(
+        "LanSync",
+        native_options,
+        Box::new(move |cc| {
+            Ok(Box::new(LanSyncGuiApp::new(
+                cc,
+                store,
+                tx_cmd,
+                tray_adapter,
+                repaint_signal,
+                show_window_flag,
+                quit_flag,
+            )))
+        }),
+    );
 
-            info!("LanSync Tray application is ready.");
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            commands::get_status,
-            commands::open_sync_folder,
-            commands::pair_device,
-            commands::approve_pairing,
-            commands::reject_pairing,
-            commands::pick_sync_folder,
-            commands::list_peers,
-            commands::list_discovered_peers,
-            commands::rescan_peers,
-            commands::unpair_device,
-            commands::list_conflicts,
-            commands::resolve_conflict,
-            commands::get_delete_mode,
-            commands::set_delete_mode,
-            commands::set_peer_delete_mode,
-            commands::list_pending_deletions,
-            commands::resolve_pending_deletion,
-            commands::list_versioned_files,
-            commands::list_file_versions,
-            commands::restore_file_version,
-            commands::is_sync_paused,
-            commands::set_sync_paused,
-            commands::get_bandwidth_limit,
-            commands::set_bandwidth_limit,
-            commands::trigger_manual_sync,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error running tauri application");
+    let _ = runtime.block_on(async { engine.shutdown().await });
+    res
 }
