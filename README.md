@@ -227,13 +227,17 @@ lansync/
 │       │   ├── versioning.rs                   # Local snapshot archival (.lansync-versions/)
 │       │   └── watcher.rs                      # Debounced cross-platform file watcher
 │       ├── tests/
-│       │   └── sync.rs                         # End-to-end integration & conflict test suite
+│       │   ├── sync.rs                         # End-to-end integration & conflict test suite
+│       │   └── unit.rs                         # Core unit test suite
 │       └── examples/
 │           └── dev.rs                          # Interactive headless CLI test harness
 └── apps/
     └── lansync-tray/                           # Native Desktop GUI & System Tray App
         ├── icons/                              # High-DPI app & tray icons (.png, .ico)
+        ├── tests/
+        │   └── unit.rs                         # Application & domain unit tests
         └── src/
+            ├── lib.rs                          # Library crate root
             ├── main.rs                         # Composition Root (wires DI, Tokio & eframe)
             ├── domain/                         # Layer 1: Pure business models & port traits
             │   ├── models.rs

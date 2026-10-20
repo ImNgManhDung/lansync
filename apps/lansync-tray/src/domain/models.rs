@@ -71,7 +71,6 @@ pub enum DeletePolicy {
 }
 
 impl DeletePolicy {
-    #[cfg(test)]
     pub fn as_code(&self) -> &'static str {
         match self {
             DeletePolicy::Never => "never",
@@ -80,7 +79,6 @@ impl DeletePolicy {
         }
     }
 
-    #[cfg(test)]
     pub fn from_code(s: &str) -> Option<Self> {
         match s {
             "never" => Some(DeletePolicy::Never),
@@ -137,35 +135,3 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_derive_original_from_conflict() {
-        assert_eq!(
-            derive_original_from_conflict("docs/report (conflict-WinPC 2026-10-14 1200).docx"),
-            "docs/report.docx"
-        );
-        assert_eq!(
-            derive_original_from_conflict("README (conflict-Mac 1).md"),
-            "README.md"
-        );
-        assert_eq!(derive_original_from_conflict("normal.txt"), "normal.txt");
-    }
-
-    #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(2048), "2.0 KB");
-        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
-    }
-
-    #[test]
-    fn test_delete_policy_roundtrip() {
-        for policy in [DeletePolicy::Never, DeletePolicy::Ask, DeletePolicy::MirrorTrash] {
-            assert_eq!(DeletePolicy::from_code(policy.as_code()), Some(policy));
-        }
-        assert_eq!(DeletePolicy::from_code("unknown"), None);
-    }
-}

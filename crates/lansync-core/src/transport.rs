@@ -134,30 +134,3 @@ pub async fn accept(tcp: TcpStream, cfg: Arc<ServerConfig>) -> Result<SecureConn
     Ok(SecureConn { stream: tls.into(), peer_cert, peer_addr })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::identity::Identity;
-    use crate::protocol::{read_msg, write_msg, Message};
-    use tokio::net::TcpListener;
-
-    #[tokio::test]
-    async fn mutual_tls_exposes_both_certs() {
-        let (a, b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let scfg = server_config(&b).unwrap();
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let mut c = accept(tcp, scfg).await.unwrap();
-            let m = read_msg(&mut c.stream).await.unwrap();
-            (c.peer_cert, m)
-        });
-        let mut client = connect(addr, client_config(&a).unwrap()).await.unwrap();
-        write_msg(&mut client.stream, &Message::Ping).await.unwrap();
-        let (server_saw, msg) = server.await.unwrap();
-        assert_eq!(client.peer_cert, b.cert_der);
-        assert_eq!(server_saw, a.cert_der);
-        assert_eq!(msg, Message::Ping);
-    }
-}

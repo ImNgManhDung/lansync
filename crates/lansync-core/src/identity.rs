@@ -48,30 +48,3 @@ impl Identity {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn device_id_is_16_base32_chars() {
-        let id = Identity::generate().unwrap();
-        assert_eq!(id.device_id.len(), 16);
-        assert!(id.device_id.chars().all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
-        assert_eq!(id.device_id, device_id_from_cert(&id.cert_der));
-    }
-
-    #[test]
-    fn load_or_create_is_stable() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = Identity::load_or_create(dir.path()).unwrap();
-        let b = Identity::load_or_create(dir.path()).unwrap();
-        assert_eq!(a.device_id, b.device_id);
-        assert_eq!(a.cert_der, b.cert_der);
-        assert_ne!(a.device_id, Identity::generate().unwrap().device_id);
-    }
-
-    #[test]
-    fn fingerprint_is_hex_sha256() {
-        assert_eq!(fingerprint(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    }
-}

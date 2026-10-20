@@ -54,7 +54,7 @@ pub fn is_active_dialer(my_id: &str, peer_id: &str) -> bool {
 }
 
 /// Calculate next exponential backoff delay with ±20% jitter.
-fn next_delay(attempt: u32) -> Duration {
+pub fn next_delay(attempt: u32) -> Duration {
     let base = (1u64 << attempt.min(6)).min(60); // 1, 2, 4, 8, 16, 32, 60s
     let jitter = rand::thread_rng().gen_range(0.8..1.2);
     Duration::from_secs_f64(base as f64 * jitter)
@@ -1830,104 +1830,3 @@ async fn send_file_to_peer(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn test_engine_start_and_shutdown() {
-        let dir = tempdir().unwrap();
-        let sync_dir = dir.path().join("sync");
-        let data_dir = dir.path().join("data");
-        let cfg = Config::new(sync_dir, 0, "TestDev".into());
-        let engine = SyncEngine::start(cfg, data_dir.clone()).await.unwrap();
-        assert!(!engine.local_device_id().is_empty());
-        engine.shutdown().await.unwrap();
-        assert!(data_dir.join(".clean_shutdown").exists(), "Clean shutdown flag must be saved upon exit");
-    }
-
-    #[tokio::test]
-    async fn test_engine_pause_and_bandwidth_limit() {
-        let dir = tempdir().unwrap();
-        let sync_dir = dir.path().join("sync");
-        let data_dir = dir.path().join("data");
-        let cfg = Config::new(sync_dir, 0, "TestDev".into());
-        let engine = SyncEngine::start(cfg, data_dir).await.unwrap();
-
-        assert!(!engine.is_paused());
-        engine.set_paused(true).await;
-        assert!(engine.is_paused());
-        engine.set_paused(false).await;
-        assert!(!engine.is_paused());
-
-        assert_eq!(engine.get_bandwidth_limit_kbps(), 0);
-        engine.set_bandwidth_limit_kbps(2048);
-        assert_eq!(engine.get_bandwidth_limit_kbps(), 2048);
-
-        engine.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn test_is_active_dialer_tie_breaker() {
-        let dev_a = "AAAA1111BBBB2222";
-        let dev_b = "ZZZZ9999YYYY8888";
-        assert!(is_active_dialer(dev_a, dev_b), "Device A (smaller) must be active dialer");
-        assert!(!is_active_dialer(dev_b, dev_a), "Device B (larger) must NOT be active dialer");
-    }
-
-    #[test]
-    fn test_next_delay_backoff_and_jitter() {
-        for _ in 0..10 {
-            let d0 = next_delay(0);
-            assert!(d0 >= Duration::from_millis(800) && d0 <= Duration::from_millis(1200));
-
-            let d1 = next_delay(1);
-            assert!(d1 >= Duration::from_millis(1600) && d1 <= Duration::from_millis(2400));
-
-            let d6 = next_delay(6);
-            assert!(d6 >= Duration::from_secs(48) && d6 <= Duration::from_secs(72));
-
-            let d10 = next_delay(10);
-            // Cap at 60s max base
-            assert!(d10 >= Duration::from_secs(48) && d10 <= Duration::from_secs(72));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_peer_status_transitions_and_events() {
-        let dir = tempdir().unwrap();
-        let sync_dir = dir.path().join("sync");
-        let data_dir = dir.path().join("data");
-        let cfg = Config::new(sync_dir, 0, "TestDev".into());
-        let engine = SyncEngine::start(cfg, data_dir).await.unwrap();
-
-        let mut rx = engine.subscribe_events();
-
-        assert_eq!(engine.get_peer_status("PEER123").await, PeerStatus::Offline);
-
-        engine.set_peer_status("PEER123", PeerStatus::Connecting).await;
-        assert_eq!(engine.get_peer_status("PEER123").await, PeerStatus::Connecting);
-
-        let ev = rx.recv().await.unwrap();
-        if let SyncEvent::PeerStatusChanged { peer_id, status } = ev {
-            assert_eq!(peer_id, "PEER123");
-            assert_eq!(status, PeerStatus::Connecting);
-        } else {
-            panic!("Expected PeerStatusChanged event");
-        }
-
-        engine.set_peer_status("PEER123", PeerStatus::Connected).await;
-        assert_eq!(engine.get_peer_status("PEER123").await, PeerStatus::Connected);
-
-        let ev = rx.recv().await.unwrap();
-        if let SyncEvent::PeerStatusChanged { peer_id, status } = ev {
-            assert_eq!(peer_id, "PEER123");
-            assert_eq!(status, PeerStatus::Connected);
-        } else {
-            panic!("Expected PeerStatusChanged event");
-        }
-
-        engine.shutdown().await.unwrap();
-    }
-}

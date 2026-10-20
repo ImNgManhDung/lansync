@@ -225,37 +225,3 @@ impl Drop for DiscoveryService {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_discovery_service_lifecycle() {
-        let mut service = DiscoveryService::new("DEVTEST123456789").unwrap();
-        service.register("TestDevice", 42424).unwrap();
-        let _rx = service.browse().unwrap();
-        service.shutdown().unwrap();
-    }
-
-    #[test]
-    fn test_lan_routable_address_filtering_and_priority() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        let loopback: IpAddr = Ipv4Addr::new(127, 0, 0, 1).into();
-        let docker: IpAddr = Ipv4Addr::new(172, 17, 0, 1).into();
-        let tailscale: IpAddr = Ipv4Addr::new(100, 80, 1, 2).into();
-        let home_lan: IpAddr = Ipv4Addr::new(192, 168, 1, 50).into();
-        let office_lan: IpAddr = Ipv4Addr::new(10, 0, 0, 20).into();
-
-        assert!(!is_lan_routable_address(&loopback));
-        assert!(!is_lan_routable_address(&docker));
-        assert!(!is_lan_routable_address(&tailscale));
-        assert!(is_lan_routable_address(&home_lan));
-        assert!(is_lan_routable_address(&office_lan));
-
-        let mut ips = vec![office_lan, home_lan];
-        ips.sort_by_key(address_priority);
-        assert_eq!(ips[0], home_lan);
-        assert_eq!(ips[1], office_lan);
-    }
-}

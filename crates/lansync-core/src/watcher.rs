@@ -74,36 +74,3 @@ impl FolderWatcher {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn watcher_detects_changes() {
-        let dir = tempdir().unwrap();
-        let (tx, mut rx) = mpsc::channel(10);
-        let _watcher = FolderWatcher::start(dir.path(), Duration::from_millis(50), tx).unwrap();
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tokio::fs::write(dir.path().join("a.txt"), b"123").await.unwrap();
-
-        let received = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await;
-        assert!(received.is_ok(), "Watcher must detect newly created file");
-    }
-
-    #[tokio::test]
-    async fn watcher_skips_ignored_files() {
-        let dir = tempdir().unwrap();
-        let (tx, mut rx) = mpsc::channel(10);
-        let _watcher = FolderWatcher::start(dir.path(), Duration::from_millis(50), tx).unwrap();
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tokio::fs::write(dir.path().join(".DS_Store"), b"junk").await.unwrap();
-        tokio::fs::write(dir.path().join(".lansync-tmp-abc"), b"junk").await.unwrap();
-        tokio::fs::write(dir.path().join("file.tmp"), b"junk").await.unwrap();
-
-        let received = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
-        assert!(received.is_err(), "Watcher must ignore .DS_Store and tmp files");
-    }
-}

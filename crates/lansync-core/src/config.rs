@@ -68,29 +68,3 @@ impl Config {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_config_save_load() {
-        let dir = tempdir().unwrap();
-        let cfg_path = dir.path().join("config.json");
-        let sync_dir = dir.path().join("LanSync");
-
-        let cfg = Config::load_or_default(&cfg_path, sync_dir.clone()).unwrap();
-        assert_eq!(cfg.listen_port, 42424);
-        assert_eq!(cfg.sync_dir, sync_dir);
-        assert_eq!(cfg.delete_mode, DeleteMode::Never);
-
-        let mut cfg2 = cfg.clone();
-        cfg2.listen_port = 50000;
-        cfg2.delete_mode = DeleteMode::MirrorTrash;
-        cfg2.save(&cfg_path).unwrap();
-
-        let loaded = Config::load_or_default(&cfg_path, sync_dir).unwrap();
-        assert_eq!(loaded.listen_port, 50000);
-        assert_eq!(loaded.delete_mode, DeleteMode::MirrorTrash);
-    }
-}

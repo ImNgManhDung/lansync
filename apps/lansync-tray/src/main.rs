@@ -1,11 +1,6 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod application;
-mod domain;
-mod infrastructure;
-mod presentation;
-
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -15,12 +10,12 @@ use tracing::{info, warn};
 use lansync_core::config::Config;
 use lansync_core::engine::SyncEngine;
 
-use crate::application::state::AppStore;
-use crate::application::use_cases::AppUseCaseInteractor;
-use crate::infrastructure::core_adapter::LanSyncCoreAdapter;
-use crate::infrastructure::os_adapter::OsSystemAdapter;
-use crate::infrastructure::tray_adapter::SystemTrayAdapter;
-use crate::presentation::LanSyncGuiApp;
+use lansync_tray::application::state::AppStore;
+use lansync_tray::application::use_cases::AppUseCaseInteractor;
+use lansync_tray::infrastructure::core_adapter::LanSyncCoreAdapter;
+use lansync_tray::infrastructure::os_adapter::OsSystemAdapter;
+use lansync_tray::infrastructure::tray_adapter::SystemTrayAdapter;
+use lansync_tray::presentation::LanSyncGuiApp;
 
 fn load_window_icon() -> Option<Arc<egui::IconData>> {
     let png_bytes = include_bytes!("../icons/128x128.png");
