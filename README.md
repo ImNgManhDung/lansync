@@ -12,6 +12,7 @@ Built in pure Rust for seamless synchronization between **macOS** and **Windows*
 [![Security](https://img.shields.io/badge/Security-mTLS_1.3_%2B_Ed25519-2ea44f?logo=letsencrypt)](https://github.com/ImNgManhDung/lansync)
 [![GUI](https://img.shields.io/badge/GUI-egui_%2F_eframe_Native-blueviolet)](https://github.com/emilk/egui)
 [![Architecture](https://img.shields.io/badge/Architecture-Clean_Architecture-00ADD8)](https://github.com/ImNgManhDung/lansync)
+[![Release](https://img.shields.io/github/v/release/ImNgManhDung/lansync?label=Release&color=success)](https://github.com/ImNgManhDung/lansync/releases/latest)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 [**Overview**](#overview) •
@@ -148,12 +149,25 @@ sequenceDiagram
 
 ## Getting Started
 
-### Prerequisites
+### Option A: Download Pre-built Installers (Recommended)
+
+Download the latest native binary from [**GitHub Releases**](https://github.com/ImNgManhDung/lansync/releases/latest) — no Rust installation required:
+
+| Operating System | Architecture | Installer / Binary |
+| :--- | :--- | :--- |
+| **macOS 12+** | Universal (Apple Silicon & Intel) | `LanSync-macos-universal.dmg` |
+| **Windows 10 / 11** | 64-bit (`x86_64`) | `LanSync-windows-x64.exe` |
+
+---
+
+### Option B: Build from Source
+
+#### Prerequisites
 
 - **Rust Toolchain**: `1.85+` (Edition 2024 supported — install via [rustup.rs](https://rustup.rs))
 - **OS**: macOS 12+ (Apple Silicon / Intel) or Windows 10/11
 
-### 1. Clone & Run the Native Desktop App
+#### 1. Clone & Run the Native Desktop App
 
 ```bash
 git clone https://github.com/ImNgManhDung/lansync.git

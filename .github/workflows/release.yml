@@ -1,0 +1,187 @@
+name: Build & Release (.exe & .dmg)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag version (e.g. v0.1.0)"
+        required: false
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Build Windows Native Executable (.exe)
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Build Windows (.exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build LanSync release binary
+        run: cargo build --release -p lansync-tray
+
+      - name: Prepare Windows artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item target/release/lansync-tray.exe dist/LanSync-windows-x64.exe
+
+      - name: Upload Windows .exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanSync-windows-x64
+          path: dist/LanSync-windows-x64.exe
+
+  # ---------------------------------------------------------------------------
+  # 2. Build macOS Application Bundle (.app) & Disk Image (.dmg)
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: Build macOS (.dmg)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Universal macOS binary (Apple Silicon + Intel)
+        run: |
+          cargo build --release -p lansync-tray --target aarch64-apple-darwin
+          cargo build --release -p lansync-tray --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/lansync-tray \
+            target/aarch64-apple-darwin/release/lansync-tray \
+            target/x86_64-apple-darwin/release/lansync-tray
+
+      - name: Package LanSync.app and LanSync-macos.dmg
+        run: |
+          APP_DIR="dist/dmg-root/LanSync.app/Contents"
+          mkdir -p "$APP_DIR/MacOS"
+          mkdir -p "$APP_DIR/Resources"
+
+          # Copy universal binary
+          cp target/universal/lansync-tray "$APP_DIR/MacOS/lansync-tray"
+          chmod +x "$APP_DIR/MacOS/lansync-tray"
+
+          # Generate macOS .icns from high-res PNG
+          ICONSET="dist/AppIcon.iconset"
+          mkdir -p "$ICONSET"
+          SRC_ICON="apps/lansync-tray/icons/icon.png"
+          sips -z 16 16     "$SRC_ICON" --out "$ICONSET/icon_16x16.png"
+          sips -z 32 32     "$SRC_ICON" --out "$ICONSET/icon_16x16@2x.png"
+          sips -z 32 32     "$SRC_ICON" --out "$ICONSET/icon_32x32.png"
+          sips -z 64 64     "$SRC_ICON" --out "$ICONSET/icon_32x32@2x.png"
+          sips -z 128 128   "$SRC_ICON" --out "$ICONSET/icon_128x128.png"
+          sips -z 256 256   "$SRC_ICON" --out "$ICONSET/icon_128x128@2x.png"
+          sips -z 256 256   "$SRC_ICON" --out "$ICONSET/icon_256x256.png"
+          sips -z 512 512   "$SRC_ICON" --out "$ICONSET/icon_256x256@2x.png"
+          sips -z 512 512   "$SRC_ICON" --out "$ICONSET/icon_512x512.png"
+          sips -z 1024 1024 "$SRC_ICON" --out "$ICONSET/icon_512x512@2x.png"
+          iconutil -c icns "$ICONSET" -o "$APP_DIR/Resources/AppIcon.icns"
+
+          # Create Info.plist
+          cat > "$APP_DIR/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>lansync-tray</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.lansync.desktop</string>
+              <key>CFBundleName</key>
+              <string>LanSync</string>
+              <key>CFBundleDisplayName</key>
+              <string>LanSync</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>0.1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>12.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSLocalNetworkUsageDescription</key>
+              <string>LanSync uses the local network to discover and synchronize files with your paired devices.</string>
+              <key>NSBonjourServices</key>
+              <array>
+                  <string>_lansync._tcp</string>
+              </array>
+          </dict>
+          </plist>
+          EOF
+
+          # Ad-hoc sign the app bundle
+          codesign --force --deep --sign - "dist/dmg-root/LanSync.app"
+
+          # Add /Applications shortcut for drag-and-drop installation
+          ln -s /Applications "dist/dmg-root/Applications"
+
+          # Create compressed .dmg installer
+          hdiutil create -volname "LanSync" \
+            -srcfolder "dist/dmg-root" \
+            -ov -format UDZO \
+            "dist/LanSync-macos-universal.dmg"
+
+      - name: Upload macOS .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanSync-macos-universal
+          path: dist/LanSync-macos-universal.dmg
+
+  # ---------------------------------------------------------------------------
+  # 3. Publish GitHub Release with .exe & .dmg
+  # ---------------------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.tag_name || 'v0.1.0' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release & Upload Installers
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "LanSync ${{ steps.tag.outputs.tag }}"
+          generate_release_notes: true
+          files: |
+            release-assets/LanSync-windows-x64.exe
+            release-assets/LanSync-macos-universal.dmg
