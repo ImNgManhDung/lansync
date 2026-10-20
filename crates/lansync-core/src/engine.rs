@@ -103,9 +103,11 @@ pub struct SyncEngine {
     peer_cancellations: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     shutdown_notify: Arc<Notify>,
     reconnect_notify: Arc<Notify>,
+    resync_tx: broadcast::Sender<()>,
     peer_statuses: Arc<Mutex<HashMap<String, PeerStatus>>>,
     local_addr: SocketAddr,
     _watcher: Arc<Mutex<Option<FolderWatcher>>>,
+    watcher_tx: mpsc::Sender<()>,
     discovery: Arc<Mutex<Option<DiscoveryService>>>,
     discovered_peers: Arc<Mutex<HashMap<String, DiscoveredPeer>>>,
     is_paused: Arc<std::sync::atomic::AtomicBool>,
@@ -197,8 +199,10 @@ impl SyncEngine {
         });
 
         let (events_tx, _) = broadcast::channel(128);
+        let (resync_tx, _) = broadcast::channel(32);
         let shutdown_notify = Arc::new(Notify::new());
         let reconnect_notify = Arc::new(Notify::new());
+        let (watcher_tx, mut watcher_rx) = mpsc::channel(16);
 
         // Start TCP Listener with TLS
         let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.listen_port));
@@ -224,9 +228,11 @@ impl SyncEngine {
             peer_cancellations: Arc::new(Mutex::new(HashMap::new())),
             shutdown_notify: shutdown_notify.clone(),
             reconnect_notify: reconnect_notify.clone(),
+            resync_tx,
             peer_statuses: Arc::new(Mutex::new(HashMap::new())),
             local_addr,
             _watcher: Arc::new(Mutex::new(None)),
+            watcher_tx: watcher_tx.clone(),
             discovery: Arc::new(Mutex::new(None)),
             discovered_peers: Arc::new(Mutex::new(HashMap::new())),
             is_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -234,7 +240,6 @@ impl SyncEngine {
         });
 
         // Start file watcher
-        let (watcher_tx, mut watcher_rx) = mpsc::channel(16);
         let watcher = FolderWatcher::start(
             &config.sync_dir,
             Duration::from_millis(500),
@@ -892,9 +897,35 @@ impl SyncEngine {
         self.bandwidth_limit_kbps.store(kbps, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub async fn set_sync_dir(&self, new_dir: PathBuf) -> Result<()> {
+        tokio::fs::create_dir_all(&new_dir).await?;
+        {
+            let mut cfg = self.config.write().await;
+            cfg.sync_dir = new_dir.clone();
+            cfg.save(&self.data_dir.join("config.json"))?;
+        }
+        {
+            let mut db = self.index_db.lock().await;
+            *db = Index::open(&self.data_dir.join("index.db"), &new_dir, &self.identity.device_id)?;
+            let _ = db.clear_missing_files_for_resync();
+            let _ = db.scan();
+        }
+        if let Ok(watcher) = FolderWatcher::start(
+            &new_dir,
+            Duration::from_millis(500),
+            self.watcher_tx.clone(),
+        ) {
+            *self._watcher.lock().await = Some(watcher);
+        }
+        self.trigger_sync_all().await;
+        Ok(())
+    }
+
     pub async fn trigger_sync_all(&self) {
+        self.is_paused.store(false, std::sync::atomic::Ordering::Relaxed);
         let local_entries = {
             let mut db = self.index_db.lock().await;
+            let _ = db.clear_missing_files_for_resync();
             let _ = db.scan();
             db.entries().unwrap_or_default()
         };
@@ -903,10 +934,11 @@ impl SyncEngine {
             map.values().cloned().collect()
         };
         for tx in senders {
-            for msg in index_messages(local_entries.clone(), false) {
+            for msg in index_messages(local_entries.clone(), true) {
                 let _ = tx.send(msg).await;
             }
         }
+        let _ = self.resync_tx.send(());
     }
 
     pub async fn set_peer_delete_mode(&self, peer_id: &str, mode: Option<crate::config::DeleteMode>) -> Result<()> {
@@ -1192,6 +1224,19 @@ impl SyncEngine {
         let mut consecutive_missed_pings: u32 = 0;
         let mut heartbeat_ticker = tokio::time::interval(Duration::from_secs(5));
         heartbeat_ticker.tick().await;
+        let mut resync_rx = self.resync_tx.subscribe();
+
+        // Spawn a dedicated reader task so read_msg(&mut r) is never cancelled mid-frame by select! branches
+        let (tx_in, mut rx_in) = mpsc::channel::<Result<Message>>(64);
+        let reader_task = tokio::spawn(async move {
+            loop {
+                let res = read_msg(&mut r).await;
+                let is_err = res.is_err();
+                if tx_in.send(res).await.is_err() || is_err {
+                    break;
+                }
+            }
+        });
 
         // Loop to read incoming messages from peer
         loop {
@@ -1200,6 +1245,20 @@ impl SyncEngine {
                 Ok(()) = &mut cancel_rx => {
                     info!("Connection cancelled locally for peer {}", peer_id);
                     break;
+                }
+                Ok(()) = resync_rx.recv() => {
+                    if !remote_entries.is_empty() {
+                        self.execute_plan(
+                            &peer_id,
+                            &remote_entries,
+                            &tx_msg,
+                            &mut expected_expected_local,
+                            &mut download_queue,
+                            current_incoming.is_some(),
+                        )
+                        .await;
+                    }
+                    continue;
                 }
                 _ = heartbeat_ticker.tick() => {
                     let elapsed = last_activity.elapsed();
@@ -1216,15 +1275,19 @@ impl SyncEngine {
                     }
                     continue;
                 }
-                res = read_msg(&mut r) => {
+                res = rx_in.recv() => {
                     match res {
-                        Ok(m) => {
+                        Some(Ok(m)) => {
                             last_activity = tokio::time::Instant::now();
                             consecutive_missed_pings = 0;
                             m
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             info!("Peer {} disconnected / read error: {:?}", peer_id, e);
+                            break;
+                        }
+                        None => {
+                            info!("Peer {} reader stream closed", peer_id);
                             break;
                         }
                     }
@@ -1389,6 +1452,8 @@ impl SyncEngine {
             }
         }
 
+        reader_task.abort();
+
         // Cleanup upon disconnection only if this connection's sender is still active
         let was_active = {
             let mut senders = self.active_peer_senders.lock().await;
@@ -1440,14 +1505,32 @@ impl SyncEngine {
         }
 
         let sync_dir = self.config.read().await.sync_dir.clone();
-        let (local_entries, bases, mut tombstones) = {
-            let db = self.index_db.lock().await;
+        let (mut local_entries, mut bases, mut tombstones) = {
+            let mut db = self.index_db.lock().await;
+            let entries = db.entries().unwrap_or_default();
+            // Detect if any indexed active file is missing on disk (e.g. folder cleared without .lansync-root)
+            let any_active_missing_on_disk = entries
+                .iter()
+                .any(|e| e.hash.is_some() && !to_fs_path(&sync_dir, &e.path).exists());
+            let marker_missing = sync_dir.is_dir() && !sync_dir.join(".lansync-root").exists();
+            if any_active_missing_on_disk || marker_missing {
+                let _ = db.clear_missing_files_for_resync();
+                let _ = db.scan();
+            }
             (
                 db.entries().unwrap_or_default(),
                 db.bases(peer_id).unwrap_or_default(),
                 db.tombstones().unwrap_or_default(),
             )
         };
+
+        // If the local sync folder has 0 active files on disk, allow all remote files to download cleanly
+        let has_any_local_file = local_entries.iter().any(|e| e.hash.is_some());
+        if !has_any_local_file && remote_entries.values().any(|e| e.hash.is_some()) {
+            local_entries.clear();
+            bases.clear();
+            tombstones.clear();
+        }
 
         // Filter out tombstones if an in-progress partial download (.lansync-part-*.tmp) exists on disk
         tombstones.retain(|path, hash| {

@@ -18,7 +18,7 @@ use crate::domain::ports::{BackendEvent, SyncBackendPort};
 
 pub struct LanSyncCoreAdapter {
     engine: Arc<SyncEngine>,
-    sync_dir: PathBuf,
+    sync_dir: std::sync::RwLock<PathBuf>,
     device_name: String,
     listen_port: u16,
     events_tx: broadcast::Sender<BackendEvent>,
@@ -45,7 +45,7 @@ impl LanSyncCoreAdapter {
 
         Self {
             engine,
-            sync_dir,
+            sync_dir: std::sync::RwLock::new(sync_dir),
             device_name,
             listen_port,
             events_tx,
@@ -125,7 +125,15 @@ impl SyncBackendPort for LanSyncCoreAdapter {
     }
 
     fn sync_dir(&self) -> PathBuf {
-        self.sync_dir.clone()
+        self.sync_dir.read().expect("sync_dir poisoned").clone()
+    }
+
+    async fn set_sync_dir(&self, new_dir: PathBuf) -> Result<()> {
+        self.engine.set_sync_dir(new_dir.clone()).await?;
+        if let Ok(mut guard) = self.sync_dir.write() {
+            *guard = new_dir;
+        }
+        Ok(())
     }
 
     fn listen_port(&self) -> u16 {
@@ -270,7 +278,7 @@ impl SyncBackendPort for LanSyncCoreAdapter {
     }
 
     async fn list_conflicts(&self) -> Vec<ConflictEntity> {
-        let sync_dir = self.sync_dir.clone();
+        let sync_dir = self.sync_dir();
         let mut conflicts = Vec::new();
 
         for entry in walkdir::WalkDir::new(&sync_dir)
@@ -312,9 +320,10 @@ impl SyncBackendPort for LanSyncCoreAdapter {
         conflict_path: &str,
         resolution: ConflictResolution,
     ) -> Result<()> {
+        let sync_dir = self.sync_dir();
         let original_rel = derive_original_from_conflict(conflict_path);
-        let conflict_full = self.sync_dir.join(conflict_path);
-        let original_full = self.sync_dir.join(&original_rel);
+        let conflict_full = sync_dir.join(conflict_path);
+        let original_full = sync_dir.join(&original_rel);
 
         match resolution {
             ConflictResolution::KeepMine => {
@@ -350,11 +359,13 @@ impl SyncBackendPort for LanSyncCoreAdapter {
     }
 
     async fn list_versioned_files(&self) -> Vec<String> {
-        lansync_core::versioning::list_all_versioned_files(&self.sync_dir)
+        let sync_dir = self.sync_dir();
+        lansync_core::versioning::list_all_versioned_files(&sync_dir)
     }
 
     async fn list_file_versions(&self, rel_path: &str) -> Result<Vec<VersionSnapshotEntity>> {
-        let items = lansync_core::versioning::list_versions(&self.sync_dir, rel_path).await?;
+        let sync_dir = self.sync_dir();
+        let items = lansync_core::versioning::list_versions(&sync_dir, rel_path).await?;
         Ok(items
             .into_iter()
             .map(|v| {
@@ -375,8 +386,9 @@ impl SyncBackendPort for LanSyncCoreAdapter {
     }
 
     async fn restore_file_version(&self, rel_path: &str, timestamp_micros: u64) -> Result<()> {
+        let sync_dir = self.sync_dir();
         lansync_core::versioning::restore_version_by_timestamp(
-            &self.sync_dir,
+            &sync_dir,
             rel_path,
             timestamp_micros,
         )

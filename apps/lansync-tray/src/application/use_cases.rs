@@ -108,9 +108,23 @@ impl AppUseCaseInteractor {
             AppCommand::PickSyncFolder => {
                 if let Some(picked) = self.system.pick_folder().await {
                     let display = picked.to_string_lossy().to_string();
-                    self.store.update(|s| {
-                        s.sync_dir = display;
-                    });
+                    if let Err(e) = self.backend.set_sync_dir(picked).await {
+                        self.store.push_activity(ActivityEntity::new(
+                            "Lỗi đổi thư mục",
+                            e.to_string(),
+                            "error",
+                        ));
+                    } else {
+                        self.store.update(|s| {
+                            s.sync_dir = display.clone();
+                        });
+                        self.store.push_activity(ActivityEntity::new(
+                            "Đã đổi thư mục đồng bộ",
+                            display,
+                            "system",
+                        ));
+                        self.refresh_snapshot().await;
+                    }
                 }
             }
             AppCommand::TriggerManualSync => {
@@ -461,6 +475,7 @@ mod tests {
         fn local_device_id(&self) -> String { "MOCK_DEV_12345678".into() }
         fn device_name(&self) -> String { "MockMac".into() }
         fn sync_dir(&self) -> PathBuf { PathBuf::from("/tmp/mock-sync") }
+        async fn set_sync_dir(&self, _new_dir: PathBuf) -> Result<()> { Ok(()) }
         fn listen_port(&self) -> u16 { 42424 }
         fn subscribe_events(&self) -> broadcast::Receiver<BackendEvent> { self.tx.subscribe() }
         fn is_paused(&self) -> bool { self.paused.load(Ordering::SeqCst) }

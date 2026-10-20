@@ -58,6 +58,7 @@ pub trait SyncBackendPort: Send + Sync {
     fn local_device_id(&self) -> String;
     fn device_name(&self) -> String;
     fn sync_dir(&self) -> PathBuf;
+    async fn set_sync_dir(&self, new_dir: PathBuf) -> Result<()>;
     fn listen_port(&self) -> u16;
     fn subscribe_events(&self) -> broadcast::Receiver<BackendEvent>;
 

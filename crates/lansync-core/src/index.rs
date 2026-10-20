@@ -160,6 +160,42 @@ impl Index {
         Ok(count > 0)
     }
 
+    pub fn forget_missing_file(&mut self, path: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM files WHERE path = ?1", [path])?;
+        self.conn.execute("DELETE FROM peer_base WHERE path = ?1", [path])?;
+        self.conn.execute("DELETE FROM tombstones WHERE path = ?1", [path])?;
+        Ok(())
+    }
+
+    /// Ensures `.lansync-root` exists if the root directory is present, and removes stale DB records
+    /// (`files`, `peer_base`, `tombstones`) for any file that does not currently exist on disk.
+    pub fn clear_missing_files_for_resync(&mut self) -> Result<usize> {
+        if self.root.exists() && self.root.is_dir() {
+            let marker = self.root.join(".lansync-root");
+            if !marker.exists() {
+                let _ = std::fs::write(&marker, b"lansync-root-marker\n");
+            }
+        }
+        let all_entries = self.entries()?;
+        let mut cleared = 0;
+        for entry in all_entries {
+            let fs_path = crate::paths::to_fs_path(&self.root, &entry.path);
+            if !fs_path.exists() {
+                self.forget_missing_file(&entry.path)?;
+                cleared += 1;
+            }
+        }
+        let tombs = self.tombstones()?;
+        for path in tombs.keys() {
+            let fs_path = crate::paths::to_fs_path(&self.root, path);
+            if !fs_path.exists() {
+                self.forget_missing_file(path)?;
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    }
+
     /// Scans directory. Only re-hashes files with changed size or mtime.
     /// Protects against external drive unmount by checking root and marker.
     pub fn scan(&mut self) -> Result<ScanReport> {

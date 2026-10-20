@@ -401,6 +401,40 @@ impl eframe::App for LanSyncGuiApp {
                                 ui.add_space(14.0);
                             }
 
+                            // Paused Sync Warning Banner
+                            if snap.is_paused {
+                                Frame::new()
+                                    .fill(p.warning_bg)
+                                    .stroke(Stroke::new(1.0_f32, p.warning_dot))
+                                    .corner_radius(CornerRadius::same(12))
+                                    .inner_margin(Margin::symmetric(18, 12))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        split_row(
+                                            ui,
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(
+                                                        "Đồng bộ đang tạm dừng — File sẽ không tự động chuyển cho đến khi tiếp tục",
+                                                    )
+                                                    .color(p.warning_dot)
+                                                    .strong()
+                                                    .size(13.0),
+                                                );
+                                            },
+                                            |ui| {
+                                                if primary_button(ui, &p, "Tiếp tục ngay").clicked()
+                                                {
+                                                    let _ = self
+                                                        .tx_cmd
+                                                        .send(AppCommand::SetPaused(false));
+                                                }
+                                            },
+                                        );
+                                    });
+                                ui.add_space(14.0);
+                            }
+
                             // Conflict & Deletion Alerts
                             render_alerts_section(ui, &snap, &p, &self.tx_cmd);
 
